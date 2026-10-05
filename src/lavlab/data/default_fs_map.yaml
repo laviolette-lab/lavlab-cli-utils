@@ -1,0 +1,52 @@
+# Default fs_map for the lab's storage layout.
+#
+# This is a "nice to have" default approximating our historical directory
+# convention; the exact regex/paths can be tuned later or overridden
+# entirely with --fs-map /path/to/custom.yaml.
+#
+# Format:
+#   ${GROUP_ID}:
+#     name: "${GROUP_NAME}"
+#     maps:
+#       - match: "${CAPTURE_REGEX}"        # applied to the image name
+#         base_dir: "/..."                 # must exist, or the whole run fails
+#         subject_glob: "${GROUP_NAME}"    # optional: named group whose value is
+#                                          # SUFFIX-matched against directories under
+#                                          # base_dir (glob "base_dir/*<value>"); the
+#                                          # match replaces base_dir. No match -> this
+#                                          # entry is skipped and the next one is tried.
+#         formatted_dir: "${name}/..."     # ${name} refers to a named regex group
+#
+# Entry order matters: HE slides get no stain subdirectory, so the HE-specific
+# pattern must come before the general-stain pattern that would also match it.
+# Subject directories on disk don't consistently share the OMERO name's prefix
+# (subject "101" lives in "1101"), hence subject_glob rather than "${subject}".
+# The "S0*" in the slide patterns strips leading zeros in the regex itself, so
+# "S06" -> "6" and "S00" -> "0", matching legacy/batch_lr.py's slide handling.
+1:
+  name: "Prostate"
+  maps:
+    # Standard numbered slide, HE stain -- no stain subdirectory.
+    - match: '^N(?P<subject>\d+)_S0*(?P<slide>\d+)(?P<deeper>_Deeper\d*)?_HE\.ome\.tiff$'
+      base_dir: "/Volumes/Siren/Prostate_data"
+      subject_glob: "subject"
+      formatted_dir: "Hist/${slide}${deeper}/Huron"
+
+    # Standard numbered slide, any other stain -- stain gets its own subdirectory.
+    - match: '^N(?P<subject>\d+)_S0*(?P<slide>\d+)(?P<deeper>_Deeper\d*)?_(?P<stain>\w+)\.ome\.tiff$'
+      base_dir: "/Volumes/Siren/Prostate_data"
+      subject_glob: "subject"
+      formatted_dir: "Hist/${slide}${deeper}/Huron/${stain}"
+
+    # Biopsy/TURP, HE stain -- the slide folder is a free-text label
+    # (e.g. "LeftLobe"), used verbatim with no zero-stripping or _Deeper handling.
+    - match: '^N(?P<subject>\d+)_(?P<slide>.+)_HE_(?:Biopsy|TURP)\.ome\.tiff$'
+      base_dir: "/Volumes/Siren/Prostate_data"
+      subject_glob: "subject"
+      formatted_dir: "Hist/${slide}/Huron"
+
+    # Biopsy/TURP, any other stain.
+    - match: '^N(?P<subject>\d+)_(?P<slide>.+)_(?P<stain>[^_]+)_(?:Biopsy|TURP)\.ome\.tiff$'
+      base_dir: "/Volumes/Siren/Prostate_data"
+      subject_glob: "subject"
+      formatted_dir: "Hist/${slide}/Huron/${stain}"

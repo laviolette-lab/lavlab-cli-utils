@@ -1,0 +1,7 @@
+FROM ubuntu:24.04
+# A Nuitka --standalone build is a directory, not a single file: lavlab-bin
+# resolves its shared libraries through RPATH=$ORIGIN, so the whole dist has
+# to stay together.
+COPY lavlab-dist /opt/lavlab
+RUN chmod +x /opt/lavlab/lavlab-bin
+ENTRYPOINT ["/opt/lavlab/lavlab-bin"]

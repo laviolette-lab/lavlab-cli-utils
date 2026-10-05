@@ -1,0 +1,228 @@
+[build-system]
+requires = [
+    # >=77 for the SPDX `license = "MIT"` string below.
+    "setuptools>=77",
+    "wheel",
+    "Nuitka>=2.0",
+    "numpy",
+    "pyvips",
+    "tifffile",
+    "imagecodecs",
+    "scikit-image",
+    "PyYAML",
+    "tqdm",
+    "omero-py",
+    "highdicom",
+    "nibabel",
+    "SimpleITK",
+    "pydicom",
+]
+# Not hatchling: setup.py's build_py stages or compiles the standalone Nuitka
+# binary into the wheel. Hatch is used only for the dev environments below.
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lavlab-cli-utils"
+dynamic = ["version"]
+description = "LAVLab CLI utilities for pulling large recons and ROI masks from OMERO, moving QuPath GeoJSON annotations in and out of OMERO, and converting between DICOM SEG and NIfTI."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE.txt"]
+keywords = ["omero", "microscopy", "pathology", "qupath", "geojson", "dicom-seg", "nifti", "cli"]
+authors = [{ name = "Donovan Murphy", email = "domurphy@mcw.edu" }]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Science/Research",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Topic :: Scientific/Engineering :: Image Processing",
+  "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# Everything needed to run `python -m lavlab ...` from a source checkout,
+# without waiting on a Nuitka build. Mirrors build-requirements.txt.
+dev = [
+    "numpy",
+    "pyvips",
+    "tifffile",
+    "imagecodecs",
+    "scikit-image",
+    "PyYAML",
+    "tqdm",
+    "omero-py",
+    "highdicom",
+    "nibabel",
+    "SimpleITK",
+    "pydicom",
+    "pytest",
+]
+
+[project.scripts]
+lavlab = "lavlab.launcher:main"
+
+[project.urls]
+Documentation = "https://github.com/DONNYMURPH/lavlab-cli-utils#readme"
+Issues = "https://github.com/DONNYMURPH/lavlab-cli-utils/issues"
+Source = "https://github.com/DONNYMURPH/lavlab-cli-utils"
+
+[tool.setuptools.dynamic]
+version = { attr = "lavlab.__about__.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["lavlab*"]
+
+[tool.setuptools.package-data]
+# bin/dist is a Nuitka --standalone build: an executable plus the shared
+# libraries and package data it loads at runtime, nested several levels deep.
+lavlab = ["py.typed", "data/*.yaml", "data/*.json", "bin/dist/*", "bin/dist/**/*"]
+
+[tool.hatch.env]
+requires = ["uv"]
+
+[tool.hatch.envs.default]
+installer = "uv"
+type = "virtual"
+# Never install the project into Hatch envs: setuptools' editable install runs
+# setup.py's build_py, which would kick off a full Nuitka compile. Tests import
+# from src/ via [tool.pytest.ini_options] pythonpath instead.
+skip-install = true
+dependencies = []
+
+[tool.hatch.envs.test]
+# Glencoe only publishes zeroc-ice wheels for 3.11/3.12 (see below).
+python = "3.11"
+dependencies = [
+  "pytest",
+  "pytest-cov",
+  "coverage[toml]>=6.2",
+  # zeroc-ice 3.6.5 has no PyPI wheels; use Glencoe's builds (same ones
+  # .github/workflows/build.yml uses) so omero-py can install.
+  "zeroc-ice @ https://github.com/glencoesoftware/zeroc-ice-py-macos-universal2/releases/download/20240131/zeroc_ice-3.6.5-cp311-cp311-macosx_11_0_universal2.whl ; sys_platform == 'darwin' and python_version == '3.11'",
+  "zeroc-ice @ https://github.com/glencoesoftware/zeroc-ice-py-macos-universal2/releases/download/20240131/zeroc_ice-3.6.5-cp312-cp312-macosx_11_0_universal2.whl ; sys_platform == 'darwin' and python_version == '3.12'",
+  "zeroc-ice @ https://github.com/glencoesoftware/zeroc-ice-py-linux-x86_64/releases/download/20240202/zeroc_ice-3.6.5-cp311-cp311-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and python_version == '3.11'",
+  "zeroc-ice @ https://github.com/glencoesoftware/zeroc-ice-py-linux-x86_64/releases/download/20240202/zeroc_ice-3.6.5-cp312-cp312-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and python_version == '3.12'",
+  "omero-py==5.21.0",
+  "numpy",
+  "pyvips",
+  "tifffile",
+  "imagecodecs",
+  "scikit-image",
+  "PyYAML",
+  "tqdm",
+  "highdicom",
+  "nibabel",
+  "SimpleITK",
+  "pydicom",
+]
+[tool.hatch.envs.test.scripts]
+test = "pytest {args:tests}"
+cov = "pytest --cov=src --cov-report=term-missing --cov-report=xml {args:tests}"
+
+[tool.hatch.envs.lint]
+dependencies = ["ruff>=0.4.0"]
+[tool.hatch.envs.lint.scripts]
+check = "ruff check src tests"
+format = "ruff format src tests"
+format-check = "ruff format src tests --check"
+fix = "ruff check --fix src tests"
+all = ["format", "fix", "check"]
+
+[tool.hatch.envs.types]
+dependencies = ["mypy>=1.0.0"]
+[tool.hatch.envs.types.scripts]
+check = "mypy --install-types --non-interactive {args:src/lavlab tests}"
+
+[tool.hatch.envs.docs]
+dependencies = [
+  "mkdocs",
+  "mkdocstrings[python]",
+  "mkdocs-material",
+  "mkdocs-autorefs",
+  "mkdocs-minify-plugin",
+  "mkdocs-material-extensions",
+  "mkdocs-git-revision-date-localized-plugin",
+]
+[tool.hatch.envs.docs.scripts]
+build-docs = "mkdocs build"
+serve-docs = "mkdocs serve"
+
+[tool.coverage.run]
+source_pkgs = ["lavlab", "tests"]
+branch = true
+parallel = true
+omit = ["src/lavlab/__about__.py"]
+
+[tool.coverage.paths]
+lavlab = ["src/lavlab", "*/lavlab-cli-utils/src/lavlab"]
+tests = ["tests", "*/lavlab-cli-utils/tests"]
+
+[tool.coverage.report]
+exclude_lines = ["no cov", "if __name__ == .__main__.:", "if TYPE_CHECKING:"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "F",   # pyflakes
+  "E",
+  "W",   # pycodestyle
+  "I",   # isort
+  "N",   # pep8-naming
+  "UP",  # pyupgrade
+  "B",   # flake8-bugbear
+  "A",   # flake8-builtins
+  "C4",  # flake8-comprehensions
+  "DTZ", # flake8-datetimez
+  "T20", # flake8-print (catches stray prints in library code)
+  "RUF", # ruff-specific rules
+]
+ignore = [
+  # int(round(x)) is deliberate: under numpy<2, round() of a numpy float
+  # returns a numpy float, not an int.
+  "RUF046",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*" = [
+  "T20",
+  # Fakes of OMERO objects have to keep OMERO's camelCase API
+  # (getPixelSizeX, getValue, ...).
+  "N802",
+  "N803",
+  # Style-only in tests; not worth churning test code for.
+  "A002",
+  "B905",
+  "C408",
+  "RUF059",
+]
+"src/lavlab/cli.py" = ["T20"]
+"src/lavlab/commands/*" = ["T20"]
+"*" = ["E501"]              # Ignore line length for all files
+
+[tool.ruff.lint.isort]
+known-first-party = ["lavlab"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# src/ for lavlab (the project is never installed into test envs -- see
+# [tool.hatch.envs.default]); . for build_native.
+pythonpath = ["src", "."]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true

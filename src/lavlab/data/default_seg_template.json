@@ -1,0 +1,28 @@
+{
+    "series_description": "Segmentation",
+    "series_number": 6,
+    "instance_number": 1,
+    "body_part_examined": "NA",
+    "content_label": "SEGMENTATION",
+    "content_description": "Image segmentation",
+    "manufacturer": "LavLab",
+    "manufacturer_model_name": "lavlab-cli-utils",
+    "software_versions": "0.1.0",
+    "device_serial_number": "NA",
+    "segments": [
+        {
+            "label": "Segmentation",
+            "category": {
+                "value": "123037004",
+                "scheme": "SCT",
+                "meaning": "Anatomical Structure"
+            },
+            "type": {
+                "value": "123037004",
+                "scheme": "SCT",
+                "meaning": "Anatomical Structure"
+            },
+            "algorithm_type": "MANUAL"
+        }
+    ]
+}

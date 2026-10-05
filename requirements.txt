@@ -1,0 +1,21 @@
+# Everything lavlab needs to run from a source checkout (`python -m lavlab ...`)
+# or to be built with Nuitka (see build-requirements.txt for the build-only
+# additions on top of this list, and Dockerfile for a reproducible build
+# environment using it).
+#
+# Install with: pip install -r requirements.txt
+#
+# omero-py additionally needs the Glencoe/ZeroC Ice wheel for your platform,
+# installed separately first, from the lab's approved direct URL. It is not
+# on PyPI and cannot be listed here.
+numpy
+pyvips[binary]
+tifffile
+scikit-image
+PyYAML
+tqdm
+omero-py
+highdicom
+nibabel
+SimpleITK
+pydicom

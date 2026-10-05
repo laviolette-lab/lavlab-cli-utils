@@ -1,0 +1,41 @@
+{
+  "name": "lavlab-cli-utils",
+  // The repo's Dockerfile is the Nuitka build environment (compiler, Ice,
+  // omero-py and every runtime dependency). It needs the Ice wheel in
+  // ./vendor/ first -- see the comment at the top of the Dockerfile.
+  // Dev containers override its bdist_wheel ENTRYPOINT.
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": "..",
+  },
+  "postCreateCommand": "pip install hatch pytest",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "autoDocstring.docstringFormat": "sphinx",
+        "[python]": {
+          "editor.defaultFormatter": "charliermarsh.ruff",
+          "editor.formatOnSave": true,
+          "editor.codeActionsOnSave": {
+            "source.fixAll.ruff": "explicit",
+            "source.organizeImports.ruff": "explicit",
+          },
+        },
+      },
+      "extensions": [
+        "ms-toolsai.jupyter",
+        "ms-python.python",
+        "charliermarsh.ruff",
+        "ms-python.mypy-type-checker",
+        "editorconfig.editorconfig",
+        "njpwerner.autodocstring",
+        "usernamehw.errorlens",
+        "Gruntfuggly.todo-tree",
+        "eamodio.gitlens",
+        "github.vscode-github-actions",
+      ],
+    },
+  },
+}

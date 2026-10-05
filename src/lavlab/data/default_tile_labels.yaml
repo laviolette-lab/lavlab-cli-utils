@@ -1,0 +1,67 @@
+# Default ROI textValue -> class folder map for `lavlab tile --roi`.
+#
+# Format:
+#   ${FOLDER_NAME}:          # the directory tiles of this class are written to
+#     - "${ALIAS}"           # a textValue that means this class
+#     - "${ANOTHER_ALIAS}"
+#
+# Matching is case-insensitive and whitespace-trimmed on both sides, so an
+# alias only needs to appear once in whichever case the annotator used.
+# Override the whole file with `--labels /path/to/custom.yaml`.
+#
+# Folder names are the Gleason spellings the downstream classifier expects
+# (G3/G4cg/G4fg/G5), which differ in case from the stroke-color palette in
+# lavlab/palettes.py (G3/G4CG/G4FG/G5) -- the palette spellings are listed
+# as aliases so ROIs labelled by `lavlab meta roi textvalue` land in the
+# right folder without anyone renaming anything.
+#
+# The non-Gleason palette labels are listed too. They are not classifier
+# classes, but annotators mark them on the same slides, and an entry here
+# is what keeps `--roi --all` from warning "unmapped textValue" on every
+# slide for labels we already know about. Their tiles go to their own
+# folders, so they can be used or ignored downstream.
+#
+# "Exclusion ROI" is deliberately absent: exclusions are not a class. They
+# are handled by `--exclude-text`, which drops any tile overlapping one
+# rather than giving it a folder. See DEFAULT_EXCLUDE_TEXT in lavlab/tiling.py.
+
+G3:
+  - "g3"
+  - "gleason 3"
+  - "gleason3"
+  - "pattern 3"
+
+G4cg:
+  - "g4cg"
+  - "g4 cg"
+  - "gleason 4 cribriform"
+  - "cribriform"
+
+G4fg:
+  - "g4fg"
+  - "g4 fg"
+  - "gleason 4 fused"
+  - "fused glands"
+
+G5:
+  - "g5"
+  - "gleason 5"
+  - "pattern 5"
+
+Atrophy:
+  - "atrophy"
+
+HGPIN:
+  - "hgpin"
+  - "high grade pin"
+
+Seminal_Vesicles:
+  - "seminal vesicles"
+  - "seminal vesicle"
+
+Vessel:
+  - "vessel"
+  - "vessels"
+
+Urethra:
+  - "urethra"

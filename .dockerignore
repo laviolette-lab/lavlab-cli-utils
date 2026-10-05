@@ -1,0 +1,17 @@
+# Never send this into the Docker build context -- some notebook outputs in
+# here contain real OMERO usernames/hostnames from being run against the
+# lab server. Same reasoning as .gitignore's /legacy/ rule.
+legacy/
+
+.git/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+native/
+wheelhouse/
+src/lavlab/bin/
+docs/
+.venv/
+venv/

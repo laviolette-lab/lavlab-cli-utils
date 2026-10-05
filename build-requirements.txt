@@ -1,0 +1,23 @@
+# Build-time dependencies only. These are not installed with the published wheel.
+# Pinned to the version last verified to build a working binary. Bump
+# deliberately and rebuild locally before tagging.
+Nuitka==4.1.3
+numpy
+pyvips[binary]
+tifffile
+imagecodecs
+scikit-image
+# Nuitka's scikit-image support calls lazy_loader._StubVisitor, which
+# lazy_loader 0.6 removed ("module 'lazy_loader' has no attribute
+# '_StubVisitor'"). Lift once a Nuitka release handles 0.6.
+lazy_loader<0.6
+PyYAML
+tqdm
+omero-py
+highdicom
+nibabel
+SimpleITK
+pydicom
+
+# Install the Glencoe/ZeroC Ice wheel separately before building, using the
+# lab's approved direct URL for the target architecture.

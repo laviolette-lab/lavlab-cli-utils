@@ -1,0 +1,57 @@
+name: Run Pytest and Codecov
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # zeroc-ice 3.6.5 has no PyPI wheels, so `pip install ".[dev]"` can't
+      # resolve omero-py. Same Glencoe wheel and pins as build.yml.
+      - name: Download zeroc-ice wheel from Glencoe (Linux x86_64)
+        run: |
+          curl -fL -O \
+            "https://github.com/glencoesoftware/zeroc-ice-py-linux-x86_64/releases/download/${ICE_RELEASE_TAG}/${ICE_WHEEL}"
+          ls -lh ${ICE_WHEEL}
+        env:
+          ICE_RELEASE_TAG: "20240202"
+          ICE_WHEEL: "zeroc_ice-3.6.5-cp311-cp311-manylinux_2_28_x86_64.whl"
+
+      - name: Install zeroc-ice and omero-py
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install zeroc_ice-3.6.5-cp311-cp311-manylinux_2_28_x86_64.whl
+          pip install omero-py==5.21.0
+          python -c "import omero.gateway, Ice; print('Ice', Ice.stringVersion())"
+
+      # Deliberately not `pip install .`: that runs setup.py's build_py, i.e. a
+      # full Nuitka compile. Tests import from src/ via pytest's pythonpath.
+      - name: Install test dependencies
+        run: |
+          pip install -r build-requirements.txt
+          pip install pytest pytest-cov "coverage[toml]>=6.2"
+
+      - name: Run pytest and generate coverage report
+        run: |
+          pytest --cov=src --cov-report=xml:coverage.xml
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: ${{ github.workspace }}/coverage.xml
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: DONNYMURPH/lavlab-cli-utils
