@@ -10,7 +10,7 @@ scikit-image
 # Nuitka's scikit-image support calls lazy_loader._StubVisitor, which
 # lazy_loader 0.6 removed ("module 'lazy_loader' has no attribute
 # '_StubVisitor'"). Lift once a Nuitka release handles 0.6.
-lazy_loader<0.6
+lazy_loader<0.7
 PyYAML
 tqdm
 omero-py
