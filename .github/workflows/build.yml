@@ -288,8 +288,8 @@ jobs:
           file: Dockerfile.runtime
           push: true
           tags: |
-            ghcr.io/donnymurph/lavlab-cli-utils:${{ github.ref_name }}
-            ghcr.io/donnymurph/lavlab-cli-utils:latest
+            ghcr.io/laviolette-lab/lavlab-cli-utils:${{ github.ref_name }}
+            ghcr.io/laviolette-lab/lavlab-cli-utils:latest
 
       - name: Smoke-test installed wheel
         run: |
