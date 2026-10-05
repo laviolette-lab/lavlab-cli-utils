@@ -1,5 +1,5 @@
 site_name: lavlab-cli-utils
-repo_url: https://github.com/DONNYMURPH/lavlab-cli-utils
+repo_url: https://github.com/laviolette-lab/lavlab-cli-utils
 theme:
   name: material
   palette:

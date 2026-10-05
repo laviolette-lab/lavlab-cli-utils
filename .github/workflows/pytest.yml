@@ -54,4 +54,4 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          slug: DONNYMURPH/lavlab-cli-utils
+          slug: laviolette-lab/lavlab-cli-utils

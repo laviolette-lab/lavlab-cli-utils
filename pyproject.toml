@@ -71,9 +71,9 @@ dev = [
 lavlab = "lavlab.launcher:main"
 
 [project.urls]
-Documentation = "https://github.com/DONNYMURPH/lavlab-cli-utils#readme"
-Issues = "https://github.com/DONNYMURPH/lavlab-cli-utils/issues"
-Source = "https://github.com/DONNYMURPH/lavlab-cli-utils"
+Documentation = "https://github.com/laviolette-lab/lavlab-cli-utils#readme"
+Issues = "https://github.com/laviolette-lab/lavlab-cli-utils/issues"
+Source = "https://github.com/laviolette-lab/lavlab-cli-utils"
 
 [tool.setuptools.dynamic]
 version = { attr = "lavlab.__about__.__version__" }
