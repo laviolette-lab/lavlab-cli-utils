@@ -282,7 +282,7 @@ jobs:
 
       - name: Build and push runtime image to GHCR
         if: startsWith(github.ref, 'refs/tags/') && matrix.python-version == '3.11'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.runtime
