@@ -12,7 +12,9 @@ permissions:
 jobs:
   build-macos-native:
     name: Build macOS arm64 native binary (Python 3.12)
-    runs-on: macos-14
+    # Apple Silicon larger runner; LTO of the full Ice module set exceeds
+    # memory on the standard macOS runner.
+    runs-on: macos-14-xlarge
     timeout-minutes: 180
     steps:
       - name: Check out repository
@@ -27,11 +29,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/Library/Caches/Nuitka
+            build/nuitka-cache
             ~/.cache/ccache
-          key: nuitka-macos-py3.12-${{ hashFiles('build-requirements.txt', 'build_native.py', 'nuitka_plugin.py', 'setup.py') }}
+          key: nuitka-macos-py3.12-v2-${{ hashFiles('build-requirements.txt', 'build_native.py', 'nuitka_plugin.py', 'setup.py') }}
           restore-keys: |
-            nuitka-macos-py3.12-
+            nuitka-macos-py3.12-v2-
 
       - name: Download zeroc-ice wheel from Glencoe
         run: |
@@ -54,6 +56,16 @@ jobs:
 
       - name: Build the native binary
         run: LAVLAB_TARGET=macos-arm64 python setup.py bdist_wheel
+        env:
+          NUITKA_CACHE_DIR: ${{ github.workspace }}/build/nuitka-cache
+
+      - name: Upload Nuitka crash report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuitka-crash-report-macos
+          path: nuitka-crash-report.xml
+          if-no-files-found: ignore
 
       - name: Assert onefile executable was staged
         run: test -x src/lavlab/bin/dist/lavlab-bin
@@ -108,11 +120,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cache/Nuitka
+            build/nuitka-cache
             ~/.cache/ccache
-          key: nuitka-linux-py3.12-${{ hashFiles('build-requirements.txt', 'build_native.py', 'nuitka_plugin.py', 'setup.py') }}
+          key: nuitka-linux-py3.12-v2-${{ hashFiles('build-requirements.txt', 'build_native.py', 'nuitka_plugin.py', 'setup.py') }}
           restore-keys: |
-            nuitka-linux-py3.12-
+            nuitka-linux-py3.12-v2-
 
       - name: Download zeroc-ice wheel from Glencoe (Linux x86_64)
         run: |
@@ -135,6 +147,39 @@ jobs:
 
       - name: Build the native binary
         run: LAVLAB_TARGET=linux-x86_64 python setup.py bdist_wheel
+        env:
+          NUITKA_CACHE_DIR: ${{ github.workspace }}/build/nuitka-cache
+
+      - name: Upload Nuitka crash report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuitka-crash-report-linux
+          path: nuitka-crash-report.xml
+          if-no-files-found: ignore
+
+      - name: Report largest Linux onefile bundle files
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          build_root = Path("build/nuitka")
+          dist_dirs = sorted(build_root.glob("*.dist"))
+          if not dist_dirs:
+              print(f"No Nuitka .dist directory under {build_root}")
+              raise SystemExit(0)
+
+          for dist in dist_dirs:
+              files = sorted(
+                  (path for path in dist.rglob("*") if path.is_file()),
+                  key=lambda path: path.stat().st_size,
+                  reverse=True,
+              )
+              total = sum(path.stat().st_size for path in files)
+              print(f"\n{dist}: {total / 1_000_000:.1f} MB across {len(files)} files")
+              for path in files[:40]:
+                  print(f"{path.stat().st_size / 1_000_000:8.1f} MB  {path.relative_to(dist)}")
+          PY
 
       - name: Assert onefile executable was staged
         run: test -x src/lavlab/bin/dist/lavlab-bin

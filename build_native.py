@@ -133,6 +133,12 @@ def build_onefile(project_dir: Path, output_dir: Path) -> Path:
         elif stale.exists():
             stale.unlink()
 
+    # Keep LTO enabled for the compact onefile binary, but cap macOS
+    # parallelism to avoid multiplying peak linker memory use.
+    jobs = max(1, (os.cpu_count() or 2) - 1)
+    if sys.platform == "darwin":
+        jobs = min(jobs, 2)
+
     command = [
         sys.executable,
         "-m",
@@ -153,7 +159,7 @@ def build_onefile(project_dir: Path, output_dir: Path) -> Path:
         "--nofollow-import-to=matplotlib",
         "--nofollow-import-to=IPython",
         "--lto=yes",
-        f"--jobs={max(1, (os.cpu_count() or 2) - 1)}",
+        f"--jobs={jobs}",
         *PYDICOM_NUITKA_FLAGS,
         *IMAGECODECS_NUITKA_FLAGS,
         *SKIMAGE_NUITKA_FLAGS,
