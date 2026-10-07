@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import logging
 
-# lavlab.seg pulls in SimpleITK, highdicom, nibabel, pydicom and numpy. It is
+# lavlab.seg pulls in highdicom, nibabel, pydicom and numpy. It is
 # imported inside the handlers so that building the argument parser -- and
 # therefore --help -- stays pure Python. seg touches neither vips nor OMERO,
 # so it should not be able to fail because of a problem in either.

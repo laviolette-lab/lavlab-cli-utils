@@ -12,9 +12,8 @@ from importlib.resources import files
 
 
 def main() -> None:
-    # A Nuitka --standalone build is a directory: the executable sits next to
-    # the shared libraries it resolves through RPATH=$ORIGIN, so it has to be
-    # run from where it was installed rather than copied out on its own.
+    # Nuitka's onefile executable carries its runtime libraries and extracts
+    # them when launched; keep the binary path stable inside the package.
     binary = files("lavlab").joinpath("bin", "dist", "lavlab-bin")
     if not binary.is_file():
         raise RuntimeError(

@@ -32,7 +32,7 @@ The package is built to run two different ways, and it matters which one
 you're using:
 
 - **Compiled binary** (what us lab members are designed to do): the
-  `lavlab` console-script just `os.execv`s a self-contained native
+  `lavlab` console-script just `os.execv`s a self-contained Nuitka onefile
   executable (`lavlab/launcher.py` -> `lavlab/bin/dist/lavlab-bin`),
   compiled ahead of time with [Nuitka](https://nuitka.net). The small
   `lavlab` launcher only starts that bundled executable; it never falls back
@@ -67,8 +67,8 @@ python -m lavlab --help
 
 The `dev` extra (and the equivalent `requirements.txt`) installs everything
 `lavlab` needs to run: `numpy`, `pyvips`, `tifffile`, `scikit-image`,
-`PyYAML`, `tqdm`, `omero-py`, `highdicom`, `nibabel`, `SimpleITK`,
-`pydicom`, `pytest`. **`omero-py` additionally needs the Glencoe/ZeroC Ice
+`PyYAML`, `tqdm`, `omero-py`, `highdicom`, `nibabel`, `pydicom`,
+`pytest`. **`omero-py` additionally needs the Glencoe/ZeroC Ice
 wheel for your platform, installed separately first** -- it isn't on PyPI.
 See `build-requirements.txt`'s comment for where to get it, or use the
 [Docker build environment](#building-with-docker) below, which handles
@@ -615,9 +615,9 @@ pip install -e ".[dev]"
 pytest
 ```
 
-Tests that need the imaging/DICOM stack (`SimpleITK`, `pydicom`) are
-skipped automatically if those packages aren't installed; the GeoJSON
-tests have no such dependency and always run. See
+Tests that need the imaging stack (`nibabel`, `pydicom`) are skipped
+automatically if those packages aren't installed; the GeoJSON tests have no
+such dependency and always run. See
 [`CONTRIBUTING.md`](CONTRIBUTING.md) for the patterns to follow when
 adding to this codebase.
 
@@ -648,23 +648,20 @@ its own directory on the path and uses the environment you already set up.
 
 Without `LAVLAB_PREBUILT_DIST`, this shells out to Nuitka (`setup.py`'s
 `build_py` override, or run `build_native.py` standalone if you just want the
-compiled binary without a full wheel) to compile `src/lavlab/__main__.py` into a standalone
-executable, bundled into the wheel as `lavlab/bin/dist/`; the
-`lavlab` console-script just execs `lavlab/bin/dist/lavlab-bin`. The
-build is `--standalone` rather than `--onefile`: the artifact is a
-directory, because `lavlab-bin` resolves its bundled shared libraries
-through `RPATH=$ORIGIN` and has to stay next to them. Onefile was
-dropped deliberately -- its bootstrap reports a child killed by a signal
-as exit 0, which turned a crash into a silent success everywhere,
-including in CI. The `.github/workflows/build.yml` workflow builds each
-platform's executable once using
+compiled binary without a full wheel) to compile `src/lavlab/__main__.py` into
+a Nuitka onefile executable, bundled into the wheel as
+`lavlab/bin/dist/lavlab-bin`. The console-script just execs that executable.
+The onefile bootstrap fix in `nuitka_plugin.py` preserves nonzero exit status
+when its child is killed by a signal; the same plugin restores Linux libvips
+before Nuitka packs the payload. The `.github/workflows/build.yml` workflow
+builds each platform's executable once using
 Python 3.12, then packages and smoke-tests it with Python 3.11 through 3.14.
 The workflow rejects builds on Intel macOS and non-x86_64 Linux. See
 [Install](#install) above for how a wheel gets to a lab member.
 
-**Both `setup.py` and `build_native.py` include a fixed set of extra
+**`build_native.py` includes a fixed set of extra
 `--include-module=`/`--include-package-data=` flags for `pydicom`**
-(`PYDICOM_NUITKA_FLAGS` in `build_native.py`), on top of the OMERO Ice
+(`PYDICOM_NUITKA_FLAGS`), on top of the OMERO Ice
 modules `omero_ice_modules()` already discovers dynamically. pydicom 3.x
 loads its pixel data decoders/encoders as a plugin-style set of submodules
 rather than through top-level imports, which Nuitka's static import
@@ -697,9 +694,9 @@ exists upstream, and decodes a file in each compression scheme.
 
 `LAVLAB_NUITKA_ARGS` (an environment variable) lets you pass additional
 raw Nuitka flags for a one-off build without editing the build scripts --
-e.g. `LAVLAB_NUITKA_ARGS="--include-package=some_other_thing" pip wheel .`.
+e.g. `LAVLAB_NUITKA_ARGS="--include-package=some_other_thing" make build-mac`.
 `LAVLAB_OUTPUT_DIR` (read by `build_native.py` only) controls where the
-standalone-script build writes its output (default: `./native/`).
+standalone-script build writes the onefile executable (default: `./native/`).
 
 ## Building with Docker
 
@@ -739,16 +736,11 @@ ever leave your machine.
   above, and `LAVLAB_NUITKA_ARGS` for the escape hatch while you figure out
   the right permanent flag to add to `PYDICOM_NUITKA_FLAGS`/the OMERO Ice
   discovery.
-- **`SimpleITK`/GDCM can't read a DICOM SEG file `lavlab seg nii2dcm`
-  wrote.** Expected for the `LABELMAP` segmentation type this command
-  writes -- SimpleITK/GDCM doesn't support parsing it directly yet, even
-  though `highdicom` (which `lavlab seg dcm2nii` uses) reads it fine. This
-  doesn't affect `lavlab seg dcm2nii`'s own output, which works around it
-  automatically (`dcmseg_to_nifti` falls back to the reference NIfTI's
-  geometry when `sitk.ReadImage` can't read a `LABELMAP` SEG's directly --
-  see the `try`/`except RuntimeError` in `src/lavlab/seg.py`) -- it only
-  matters if you're trying to open the file with some *other* tool that
-  goes through SimpleITK.
+- **A third-party reader cannot open a DICOM SEG file `lavlab seg nii2dcm`
+  wrote.** This command writes the DICOM `LABELMAP` segmentation type. Make
+  sure the other reader supports that type; `lavlab seg dcm2nii` reads the
+  file through `highdicom` and uses the reference NIfTI geometry when the
+  SEG doesn't carry per-frame geometry.
 - **`Image N: OMERO could not read this image's pixels`** (an
   `omero.ResourceError`, "Error instantiating pixel buffer"). The image's
   file is missing or corrupt on the OMERO server -- nothing on your side

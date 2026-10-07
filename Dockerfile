@@ -3,7 +3,7 @@
 # This image is NOT a runtime image -- it does not contain the compiled
 # lavlab binary. It's a pinned, disposable environment with the C compiler,
 # Nuitka, and every runtime dependency (numpy, pyvips, omero-py, highdicom,
-# SimpleITK, ...) pre-installed, so the Nuitka/Ice build doesn't depend on
+# ...) pre-installed, so the Nuitka/Ice build doesn't depend on
 # whatever happens to be installed on a given laptop. The actual compile
 # runs against your live source tree, mounted in at `docker run` time --
 # see usage below.

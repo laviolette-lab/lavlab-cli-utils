@@ -17,5 +17,4 @@ tqdm
 omero-py
 highdicom
 nibabel
-SimpleITK
 pydicom

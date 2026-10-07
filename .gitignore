@@ -78,7 +78,7 @@ dmypy.json
 
 # --- lavlab-specific (carried over from the pre-taps .gitignore) ---
 
-# Nuitka build output: setup.py stages the standalone dist here, and
+# Nuitka build output: setup.py stages the onefile executable here, and
 # build_native.py writes to native/.
 src/lavlab/bin/
 native/

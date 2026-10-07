@@ -28,10 +28,9 @@ pytest
 
 `tests/test_geometry.py` and `tests/test_geojson_io.py` have no
 dependencies beyond the standard library and always run.
-`tests/test_seg.py` uses `pytest.importorskip` for `SimpleITK`/`pydicom` --
-it's skipped, not failed, if the imaging stack isn't installed, so you can
-still run the suite without the full `dev` extra if you're only touching
-GeoJSON code.
+`tests/test_seg.py` uses `pytest.importorskip` for `nibabel`/`pydicom` -- it's
+skipped, not failed, if the imaging stack isn't installed, so you can still
+run the suite without the full `dev` extra if you're only touching GeoJSON code.
 
 If you touch `src/lavlab/seg.py`, run the tests with the real imaging stack
 installed and pay attention to
@@ -88,8 +87,8 @@ a template rather than inventing a new structure:
 - **Raise specific exceptions, not generic ones.** `FileNotFoundError` for
   a missing path, `ValueError` for bad/mismatched data, a custom exception
   (like `ConversionError`, `ConfigError`) where neither fits. Don't let a
-  third-party library's internal traceback (a raw `pydicom`/`SimpleITK`
-  stack trace, an Ice connection error) be the only signal a user gets --
+  third-party library's internal traceback (a raw `pydicom` stack trace, an Ice
+  connection error) be the only signal a user gets --
   catch it and re-raise with a message that says what to actually do.
 - **No comments that restate the code.** A comment earns its place only
   when it explains a non-obvious constraint, a workaround for a specific

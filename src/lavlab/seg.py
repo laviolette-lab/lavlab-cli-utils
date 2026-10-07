@@ -13,8 +13,7 @@ Two independent directions live here:
 
 Both are local file conversions -- neither talks to OMERO -- and both raise
 a specific exception (``FileNotFoundError``, ``ValueError``) on bad input
-rather than letting ``pydicom``/``SimpleITK`` surface a confusing low-level
-traceback.
+rather than letting ``pydicom`` surface a confusing low-level traceback.
 """
 
 from __future__ import annotations
@@ -32,7 +31,7 @@ import highdicom.seg as hdseg
 import nibabel as nib
 import numpy as np
 import pydicom
-import SimpleITK as sitk  # noqa: N813
+from nibabel.spatialimages import SpatialImage
 from pydicom.sr.coding import Code
 
 log = logging.getLogger(__name__)
@@ -78,17 +77,9 @@ def format_output_path(output_dir: str, nii_name: str, seg_name: str) -> str:
     )
 
 
-def read_nii(nii_path: str) -> sitk.Image:
-    """Read a NIfTI file.
-
-    :param nii_path: path to the NIfTI file
-    :type nii_path: str
-    :return: the loaded image
-    :rtype: sitk.Image
-    """
-    reader = sitk.ImageFileReader()
-    reader.SetFileName(nii_path)
-    return reader.Execute()
+def read_nii(nii_path: str) -> SpatialImage:
+    """Read a NIfTI file."""
+    return nib.load(nii_path)
 
 
 def read_seg(dicom_seg_path: str) -> highdicom.seg.Segmentation:
@@ -102,76 +93,99 @@ def read_seg(dicom_seg_path: str) -> highdicom.seg.Segmentation:
     return highdicom.seg.segread(dicom_seg_path)
 
 
-def get_affine_from_sitk(image: sitk.Image) -> np.ndarray:
-    """Extract a NIfTI-style affine matrix from a SimpleITK image.
-
-    :param image: the image to read geometry from
-    :type image: sitk.Image
-    :return: 4x4 affine matrix
-    :rtype: np.ndarray
-    """
-    direction = image.GetDirection()
-    origin = image.GetOrigin()
-    spacing = image.GetSpacing()
-
-    direction_matrix = np.array(direction).reshape(3, 3)
-
-    affine = np.eye(4)
-    for i in range(3):
-        for j in range(3):
-            affine[i, j] = direction_matrix[i, j] * spacing[j]
-    affine[:3, 3] = origin
-
-    return affine
+def get_affine_from_nifti(image: SpatialImage) -> np.ndarray:
+    """Return the image's voxel-to-world affine matrix."""
+    return np.asarray(image.affine)
 
 
-def flip_based_on_affine(seg_data: sitk.Image, ref_image: sitk.Image) -> sitk.Image:
-    """Flip axes of ``seg_data`` where its orientation disagrees with ``ref_image``.
+def _get_dicom_seg_affine(seg_data: pydicom.Dataset) -> np.ndarray | None:
+    """Read the DICOM SEG's first-frame geometry, if it is available."""
+    per_frame = getattr(seg_data, "PerFrameFunctionalGroupsSequence", [])
+    shared = getattr(seg_data, "SharedFunctionalGroupsSequence", [])
+    groups = [*per_frame[:1], *shared[:1]]
 
-    :param seg_data: the image to (maybe) flip
-    :type seg_data: sitk.Image
-    :param ref_image: the image whose orientation is authoritative
-    :type ref_image: sitk.Image
-    :return: the correctly oriented image
-    :rtype: sitk.Image
-    """
-    src_x, src_y, _ = nib.aff2axcodes(  # pylint: disable=unbalanced-tuple-unpacking
-        get_affine_from_sitk(seg_data)
+    def first_item(sequence_name: str):
+        for group in groups:
+            sequence = getattr(group, sequence_name, None)
+            if sequence:
+                return sequence[0]
+        return None
+
+    orientation = first_item("PlaneOrientationSequence")
+    position = first_item("PlanePositionSequence")
+    measures = first_item("PixelMeasuresSequence")
+    if orientation is None or position is None or measures is None:
+        return None
+
+    iop = np.asarray(orientation.ImageOrientationPatient, dtype=float)
+    pixel_spacing = np.asarray(measures.PixelSpacing, dtype=float)
+    if iop.shape != (6,) or pixel_spacing.shape != (2,):
+        return None
+
+    row_direction, column_direction = iop[:3], iop[3:]
+    slice_direction = np.cross(row_direction, column_direction)
+    slice_spacing = float(
+        getattr(measures, "SpacingBetweenSlices", None)
+        or getattr(measures, "SliceThickness", 1.0)
     )
-    dest_x, dest_y, _ = nib.aff2axcodes(  # pylint: disable=unbalanced-tuple-unpacking
-        get_affine_from_sitk(ref_image)
-    )
-    flips = [src_x != dest_x, src_y != dest_y, False]
-    return sitk.Flip(seg_data, flips)
+
+    affine_lps = np.eye(4)
+    affine_lps[:3, 0] = row_direction * pixel_spacing[1]
+    affine_lps[:3, 1] = column_direction * pixel_spacing[0]
+    affine_lps[:3, 2] = slice_direction * slice_spacing
+    affine_lps[:3, 3] = np.asarray(position.ImagePositionPatient, dtype=float)
+
+    # DICOM patient coordinates are LPS; NIfTI affine world coordinates are RAS.
+    lps_to_ras = np.diag([-1.0, -1.0, 1.0, 1.0])
+    return lps_to_ras @ affine_lps
 
 
-def format_nifti(seg_data: sitk.Image, ref_nii: sitk.Image) -> sitk.Image:
-    """Orient a DICOM-SEG-derived image to match NIfTI conventions.
-
-    :param seg_data: the segmentation channel to format
-    :type seg_data: sitk.Image
-    :param ref_nii: the reference NIfTI image
-    :type ref_nii: sitk.Image
-    :return: the formatted image
-    :rtype: sitk.Image
-    """
-    seg_data = flip_based_on_affine(seg_data, ref_nii)
-    # NIfTI uses opposite z indexing from DICOM.
-    seg_data = sitk.Flip(seg_data, [False, False, True])
-    return seg_data
+def _flip_affine_axis(affine: np.ndarray, axis: int, length: int) -> np.ndarray:
+    """Update an affine for a voxel-axis reversal while preserving world positions."""
+    transform = np.eye(4)
+    transform[axis, axis] = -1
+    transform[axis, 3] = length - 1
+    return affine @ transform
 
 
-def write_nifti(nii: sitk.Image, nii_path: str) -> None:
-    """Write a NIfTI image to disk.
+def flip_based_on_affine(
+    seg_data: np.ndarray, seg_affine: np.ndarray, ref_affine: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Flip the first two voxel axes when SEG and reference orientations differ."""
+    source_codes = nib.aff2axcodes(seg_affine)
+    reference_codes = nib.aff2axcodes(ref_affine)
+    affine = np.asarray(seg_affine).copy()
 
-    :param nii: the image to write
-    :type nii: sitk.Image
-    :param nii_path: destination path
-    :type nii_path: str
-    """
-    writer = sitk.ImageFileWriter()
-    writer.SetFileName(nii_path)
-    writer.Execute(nii)
+    for axis in (0, 1):
+        if source_codes[axis] != reference_codes[axis]:
+            seg_data = np.flip(seg_data, axis=axis)
+            affine = _flip_affine_axis(affine, axis, seg_data.shape[axis])
+
+    return seg_data, affine
+
+
+def format_nifti(
+    seg_data: np.ndarray, seg_affine: np.ndarray, ref_affine: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Orient DICOM SEG voxels and geometry to match NIfTI conventions."""
+    seg_data, affine = flip_based_on_affine(seg_data, seg_affine, ref_affine)
+    # DICOM SEG frame order uses the opposite z indexing from NIfTI.
+    seg_data = np.flip(seg_data, axis=2)
+    affine = _flip_affine_axis(affine, 2, seg_data.shape[2])
+    return seg_data, affine
+
+
+def write_nifti(
+    data: np.ndarray,
+    affine: np.ndarray,
+    nii_path: str,
+    header: nib.Nifti1Header | None = None,
+) -> None:
+    """Write a voxel array and affine matrix to a NIfTI file."""
+    output_header = header.copy() if header is not None else None
+    if output_header is not None:
+        output_header.set_data_dtype(data.dtype)
+    nib.save(nib.Nifti1Image(data, affine, header=output_header), nii_path)
 
 
 def split_seg_channels(
@@ -197,24 +211,6 @@ def split_seg_channels(
         yield segment_number, pixels
 
 
-def copy_sitk_image_info(src: sitk.Image, dst: sitk.Image) -> sitk.Image:
-    """Copy spacing/origin/direction/metadata from one image to another.
-
-    :param src: the image to copy from
-    :type src: sitk.Image
-    :param dst: the image to copy onto
-    :type dst: sitk.Image
-    :return: ``dst``, with copied information
-    :rtype: sitk.Image
-    """
-    dst.SetSpacing(src.GetSpacing())
-    dst.SetOrigin(src.GetOrigin())
-    dst.SetDirection(src.GetDirection())
-    for key in src.GetMetaDataKeys():
-        dst.SetMetaData(key, src.GetMetaData(key))
-    return dst
-
-
 def dcmseg_to_nifti(dicom_seg_path: str, nii_path: str, output_dir: str) -> list[str]:
     """Split a DICOM SEG file into one NIfTI file per segment.
 
@@ -235,18 +231,16 @@ def dcmseg_to_nifti(dicom_seg_path: str, nii_path: str, output_dir: str) -> list
         raise FileNotFoundError(f"reference NIfTI file not found: {nii_path}")
     os.makedirs(output_dir, exist_ok=True)
 
-    dicom_seg = read_seg(dicom_seg_path)  # (z, x, y)
-    nii = read_nii(nii_path)  # (x, y, z)
-    try:
-        sitk_dcm_seg = sitk.ReadImage(dicom_seg_path)
-    except RuntimeError:
+    dicom_seg = read_seg(dicom_seg_path)  # pixel channels are (z, y, x)
+    nii = read_nii(nii_path)  # nibabel voxel arrays are (x, y, z)
+    if len(nii.shape) != 3:
+        raise ValueError(f"reference NIfTI must be 3D, got shape {nii.shape}")
+    seg_affine = _get_dicom_seg_affine(dicom_seg)
+    if seg_affine is None:
         log.info(
-            "SimpleITK could not read geometry directly from %s "
-            "(expected for LABELMAP-type SEGs); using the reference "
-            "NIfTI's geometry instead.",
-            dicom_seg_path,
+            "DICOM SEG geometry is unavailable; using the reference NIfTI's geometry."
         )
-        sitk_dcm_seg = nii
+        seg_affine = get_affine_from_nifti(nii)
 
     segments_by_number = {
         segment.SegmentNumber: segment for segment in dicom_seg.SegmentSequence
@@ -254,14 +248,15 @@ def dcmseg_to_nifti(dicom_seg_path: str, nii_path: str, output_dir: str) -> list
 
     out_paths = []
     for segment_number, seg_channel in split_seg_channels(dicom_seg):
-        nii_out = sitk.GetImageFromArray(seg_channel)
-        if nii_out.GetSize() != nii.GetSize():
+        nii_data = np.transpose(seg_channel, (2, 1, 0))
+        if nii_data.shape != nii.shape[:3]:
             raise ValueError(
-                f"segmentation size {nii_out.GetSize()} does not match "
-                f"NIfTI size {nii.GetSize()}"
+                f"segmentation size {nii_data.shape} does not match "
+                f"NIfTI size {nii.shape[:3]}"
             )
-        nii_out = copy_sitk_image_info(sitk_dcm_seg, nii_out)
-        nii_out = format_nifti(nii_out, nii)
+        nii_data, output_affine = format_nifti(
+            nii_data, seg_affine, get_affine_from_nifti(nii)
+        )
         segment = segments_by_number.get(segment_number)
         if segment is None:
             raise ValueError(
@@ -271,7 +266,7 @@ def dcmseg_to_nifti(dicom_seg_path: str, nii_path: str, output_dir: str) -> list
         nii_code = segment.SegmentedPropertyTypeCodeSequence[0].CodeMeaning
         nii_basename = os.path.basename(nii_path).split(".")[0]
         channel_output_path = format_output_path(output_dir, nii_basename, nii_code)
-        write_nifti(nii_out, channel_output_path)
+        write_nifti(nii_data, output_affine, channel_output_path, nii.header)
         out_paths.append(channel_output_path)
 
     return out_paths
@@ -396,9 +391,11 @@ def nifti_to_dcmseg(
         )
     template = json.loads(resolved_template.read_text(encoding="utf-8"))
 
-    segmentation = sitk.ReadImage(str(mask_path))
-    segmentation = sitk.Cast(segmentation, sitk.sitkUInt8)
-    mask_array = sitk.GetArrayFromImage(segmentation)  # (z, y, x)
+    segmentation = read_nii(str(mask_path))
+    if len(segmentation.shape) != 3:
+        raise ValueError(f"NIfTI mask must be 3D, got shape {segmentation.shape}")
+    mask_xyz = np.asanyarray(segmentation.dataobj).astype(np.uint8, copy=False)
+    mask_array = np.transpose(mask_xyz, (2, 1, 0))  # (z, y, x)
     source_images = _read_series_in_slice_order(dicom_series_paths)
     if len(source_images) != mask_array.shape[0]:
         raise ValueError(
@@ -439,12 +436,11 @@ def nifti_to_dcmseg(
 
 
 __all__ = [
-    "copy_sitk_image_info",
     "dcmseg_to_nifti",
     "flip_based_on_affine",
     "format_nifti",
     "format_output_path",
-    "get_affine_from_sitk",
+    "get_affine_from_nifti",
     "nifti_to_dcmseg",
     "read_nii",
     "read_seg",

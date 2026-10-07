@@ -14,10 +14,9 @@ requires = [
     "omero-py",
     "highdicom",
     "nibabel",
-    "SimpleITK",
     "pydicom",
 ]
-# Not hatchling: setup.py's build_py stages or compiles the standalone Nuitka
+# Not hatchling: setup.py's build_py stages or compiles the Nuitka onefile
 # binary into the wheel. Hatch is used only for the dev environments below.
 build-backend = "setuptools.build_meta"
 
@@ -62,7 +61,6 @@ dev = [
     "omero-py",
     "highdicom",
     "nibabel",
-    "SimpleITK",
     "pydicom",
     "pytest",
 ]
@@ -83,8 +81,7 @@ where = ["src"]
 include = ["lavlab*"]
 
 [tool.setuptools.package-data]
-# bin/dist is a Nuitka --standalone build: an executable plus the shared
-# libraries and package data it loads at runtime, nested several levels deep.
+# bin/dist contains the Nuitka --onefile executable.
 lavlab = ["py.typed", "data/*.yaml", "data/*.json", "bin/dist/*", "bin/dist/**/*"]
 
 [tool.hatch.env]
@@ -122,7 +119,6 @@ dependencies = [
   "tqdm",
   "highdicom",
   "nibabel",
-  "SimpleITK",
   "pydicom",
 ]
 [tool.hatch.envs.test.scripts]

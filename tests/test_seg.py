@@ -1,32 +1,36 @@
 # SPDX-FileCopyrightText: 2026-present LavLab <domurphy@mcw.edu>
 #
 # SPDX-License-Identifier: MIT
-"""Tests for lavlab.seg -- skipped if the heavy imaging deps aren't installed
-(they're in the `dev` extra, not required just to import the rest of the package)."""
+"""Tests for lavlab.seg -- skipped if pydicom isn't installed."""
 
 import os
+import subprocess
 
 import numpy as np
 import pytest
 
-sitk = pytest.importorskip("SimpleITK")
+nib = pytest.importorskip("nibabel")
 pydicom = pytest.importorskip("pydicom")
 
 from lavlab.seg import (  # noqa: E402
     dcmseg_to_nifti,
     flip_based_on_affine,
     format_output_path,
-    get_affine_from_sitk,
+    get_affine_from_nifti,
     nifti_to_dcmseg,
 )
 
 
 def _image(size=(4, 4, 2), spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0)):
-    arr = np.zeros(size[::-1], dtype=np.uint8)
-    img = sitk.GetImageFromArray(arr)
-    img.SetSpacing(spacing)
-    img.SetOrigin(origin)
-    return img
+    arr = np.zeros(size, dtype=np.uint8)
+    affine = np.diag([-spacing[0], -spacing[1], spacing[2], 1.0])
+    affine[:3, 3] = [-origin[0], -origin[1], origin[2]]
+    return nib.Nifti1Image(arr, affine)
+
+
+def _write_nii_from_zyx(path, data):
+    affine = np.diag([-1.0, -1.0, 1.0, 1.0])
+    nib.save(nib.Nifti1Image(data.transpose(2, 1, 0), affine), path)
 
 
 def _write_synthetic_series(dicom_dir, rows=8, cols=8, slices=3):
@@ -92,10 +96,7 @@ def test_nifti_to_dcmseg_round_trips_through_dcmseg_to_nifti(tmp_path):
     mask = np.zeros((slices, rows, cols), dtype=np.uint8)
     mask[1, 2:5, 2:5] = 1
     mask_path = tmp_path / "mask.nii.gz"
-    mask_img = sitk.GetImageFromArray(mask)
-    mask_img.SetSpacing((1.0, 1.0, 1.0))
-    mask_img.SetOrigin((0.0, 0.0, 0.0))
-    sitk.WriteImage(mask_img, str(mask_path))
+    _write_nii_from_zyx(mask_path, mask)
 
     seg_path = tmp_path / "out_seg.dcm"
     nifti_to_dcmseg(
@@ -114,8 +115,59 @@ def test_nifti_to_dcmseg_round_trips_through_dcmseg_to_nifti(tmp_path):
     out_paths = dcmseg_to_nifti(str(seg_path), str(mask_path), str(out_dir))
     assert len(out_paths) == 1
 
-    recovered = sitk.GetArrayFromImage(sitk.ReadImage(out_paths[0]))
+    recovered_xyz = np.asanyarray(nib.load(out_paths[0]).dataobj)
+    recovered = recovered_xyz.transpose(2, 1, 0)
     assert np.array_equal(recovered > 0, mask > 0)
+
+
+def test_onefile_binary_seg_conversions_when_configured(tmp_path):
+    binary = os.environ.get("LAVLAB_BINARY")
+    if not binary:
+        pytest.skip("LAVLAB_BINARY is not set")
+
+    dicom_dir = tmp_path / "dicom"
+    dicom_dir.mkdir()
+    _write_synthetic_series(dicom_dir)
+    mask = np.zeros((3, 8, 8), dtype=np.uint8)
+    mask[1, 2:4, 3:5] = 1
+    mask_path = tmp_path / "mask.nii.gz"
+    _write_nii_from_zyx(mask_path, mask)
+    seg_path = tmp_path / "seg.dcm"
+
+    subprocess.run(
+        [
+            binary,
+            "seg",
+            "nii2dcm",
+            str(mask_path),
+            str(dicom_dir),
+            "--out",
+            str(seg_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert pydicom.dcmread(seg_path).Modality == "SEG"
+
+    output_dir = tmp_path / "nifti"
+    subprocess.run(
+        [
+            binary,
+            "seg",
+            "dcm2nii",
+            str(seg_path),
+            str(mask_path),
+            "--out",
+            str(output_dir),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    outputs = list(output_dir.glob("*.nii.gz"))
+    assert len(outputs) == 1
+    assert nib.load(outputs[0]).shape == (8, 8, 3)
 
 
 def test_format_output_path():
@@ -138,23 +190,36 @@ def test_format_output_path_empty_segment_name_falls_back():
     assert path == "/out/case01_segment.nii.gz"
 
 
-def test_get_affine_from_sitk_identity():
+def test_get_affine_from_nifti_returns_image_affine():
     img = _image()
-    affine = get_affine_from_sitk(img)
+    affine = get_affine_from_nifti(img)
     assert affine.shape == (4, 4)
-    assert np.allclose(affine, np.eye(4))
+    assert np.array_equal(affine, img.affine)
 
 
 def test_flip_based_on_affine_same_orientation_is_noop():
     img = _image()
+    data = np.arange(4 * 4 * 2).reshape((4, 4, 2))
+    flipped, affine = flip_based_on_affine(data, img.affine, img.affine)
+    assert np.array_equal(flipped, data)
+    assert np.array_equal(affine, img.affine)
+
+
+def test_flip_based_on_affine_reverses_mismatched_axis_and_updates_affine():
     ref = _image()
-    flipped = flip_based_on_affine(img, ref)
-    assert flipped.GetSize() == img.GetSize()
+    source_affine = ref.affine.copy()
+    source_affine[0, 0] *= -1
+    data = np.arange(4 * 4 * 2).reshape((4, 4, 2))
+
+    flipped, affine = flip_based_on_affine(data, source_affine, ref.affine)
+
+    assert np.array_equal(flipped, np.flip(data, axis=0))
+    assert nib.aff2axcodes(affine) == nib.aff2axcodes(ref.affine)
 
 
 def test_dcmseg_to_nifti_missing_dicom_seg_raises(tmp_path):
     ref_nii = tmp_path / "ref.nii.gz"
-    sitk.WriteImage(_image(), str(ref_nii))
+    nib.save(_image(), ref_nii)
 
     with pytest.raises(FileNotFoundError):
         dcmseg_to_nifti(
@@ -183,7 +248,7 @@ def test_nifti_to_dcmseg_missing_mask_raises(tmp_path):
 
 def test_nifti_to_dcmseg_missing_reference_dir_raises(tmp_path):
     mask = tmp_path / "mask.nii.gz"
-    sitk.WriteImage(_image(), str(mask))
+    nib.save(_image(), mask)
 
     with pytest.raises(FileNotFoundError):
         nifti_to_dcmseg(
@@ -195,7 +260,7 @@ def test_nifti_to_dcmseg_missing_reference_dir_raises(tmp_path):
 
 def test_nifti_to_dcmseg_empty_reference_dir_raises(tmp_path):
     mask = tmp_path / "mask.nii.gz"
-    sitk.WriteImage(_image(), str(mask))
+    nib.save(_image(), mask)
     empty_dir = tmp_path / "dicom"
     empty_dir.mkdir()
 

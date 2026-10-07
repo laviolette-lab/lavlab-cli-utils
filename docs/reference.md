@@ -608,5 +608,5 @@ Both raise `FileNotFoundError` for missing inputs and `ValueError` for
 shape/size mismatches or malformed templates, rather than letting a lower
 library's traceback surface. Lower-level helpers (also exported, see
 `src/lavlab/seg.py`'s `__all__`): `format_output_path`, `read_nii`, `read_seg`,
-`get_affine_from_sitk`, `flip_based_on_affine`, `format_nifti`,
-`write_nifti`, `split_seg_channels`, `copy_sitk_image_info`.
+`get_affine_from_nifti`, `flip_based_on_affine`, `format_nifti`,
+`write_nifti`, `split_seg_channels`.

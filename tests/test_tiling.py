@@ -1582,7 +1582,7 @@ def test_tile_help_works_without_numpy_pyvips_or_omero():
         """
         import sys
 
-        BLOCKED = {"numpy", "pyvips", "omero", "skimage", "tifffile", "SimpleITK"}
+        BLOCKED = {"numpy", "pyvips", "omero", "skimage", "tifffile"}
 
         class Blocker:
             def find_spec(self, name, path=None, target=None):

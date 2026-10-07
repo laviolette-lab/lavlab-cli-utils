@@ -29,7 +29,7 @@ jobs:
           path: |
             ~/Library/Caches/Nuitka
             ~/.cache/ccache
-          key: nuitka-macos-py3.12-${{ hashFiles('build-requirements.txt', 'build_native.py', 'setup.py') }}
+          key: nuitka-macos-py3.12-${{ hashFiles('build-requirements.txt', 'build_native.py', 'nuitka_plugin.py', 'setup.py') }}
           restore-keys: |
             nuitka-macos-py3.12-
 
@@ -55,12 +55,8 @@ jobs:
       - name: Build the native binary
         run: LAVLAB_TARGET=macos-arm64 python setup.py bdist_wheel
 
-      - name: Assert imagecodecs codecs were bundled
-        run: |
-          for m in _shared_cython _jpeg8 _jpeg2k _imcd _ljpeg; do
-            test -f "src/lavlab/bin/dist/imagecodecs/$m.so" \
-              || { echo "codec $m missing from dist"; exit 1; }
-          done
+      - name: Assert onefile executable was staged
+        run: test -x src/lavlab/bin/dist/lavlab-bin
 
       - name: Run tests and smoke-test native binary
         run: |
@@ -70,6 +66,8 @@ jobs:
           out=$(./src/lavlab/bin/dist/lavlab-bin --help) || exit 1
           [ -n "$out" ] || { echo "--help produced no output"; exit 1; }
           case "$out" in usage:*) ;; *) echo "unexpected --help output"; exit 1 ;; esac
+        env:
+          LAVLAB_BINARY: src/lavlab/bin/dist/lavlab-bin
 
       - name: Archive native distribution
         run: tar -C src/lavlab/bin -czf dist/lavlab-macos-arm64.tar.gz dist
@@ -112,7 +110,7 @@ jobs:
           path: |
             ~/.cache/Nuitka
             ~/.cache/ccache
-          key: nuitka-linux-py3.12-${{ hashFiles('build-requirements.txt', 'build_native.py', 'setup.py') }}
+          key: nuitka-linux-py3.12-${{ hashFiles('build-requirements.txt', 'build_native.py', 'nuitka_plugin.py', 'setup.py') }}
           restore-keys: |
             nuitka-linux-py3.12-
 
@@ -138,12 +136,8 @@ jobs:
       - name: Build the native binary
         run: LAVLAB_TARGET=linux-x86_64 python setup.py bdist_wheel
 
-      - name: Assert imagecodecs codecs were bundled
-        run: |
-          for m in _shared_cython _jpeg8 _jpeg2k _imcd _ljpeg; do
-            test -f "src/lavlab/bin/dist/imagecodecs/$m.so" \
-              || { echo "codec $m missing from dist"; exit 1; }
-          done
+      - name: Assert onefile executable was staged
+        run: test -x src/lavlab/bin/dist/lavlab-bin
 
       - name: Run tests and smoke-test native binary
         run: |
@@ -153,6 +147,8 @@ jobs:
           out=$(./src/lavlab/bin/dist/lavlab-bin --help) || exit 1
           [ -n "$out" ] || { echo "--help produced no output"; exit 1; }
           case "$out" in usage:*) ;; *) echo "unexpected --help output"; exit 1 ;; esac
+        env:
+          LAVLAB_BINARY: src/lavlab/bin/dist/lavlab-bin
 
       - name: Archive native distribution
         run: tar -C src/lavlab/bin -czf dist/lavlab-linux-x86_64.tar.gz dist
@@ -204,6 +200,21 @@ jobs:
         env:
           LAVLAB_TARGET: macos-arm64
           LAVLAB_PREBUILT_DIST: prebuilt/dist
+
+      - name: Assert wheel is below PyPI's file-size limit
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          wheels = list(Path("dist").glob("*.whl"))
+          if not wheels:
+              raise SystemExit("no wheel was built")
+          for wheel in wheels:
+              size = wheel.stat().st_size
+              print(f"{wheel}: {size / 1_000_000:.1f} MB")
+              if size >= 100_000_000:
+                  raise SystemExit(f"{wheel} exceeds PyPI's 100 MB file limit")
+          PY
 
       - name: Smoke-test installed wheel
         run: |
@@ -267,6 +278,21 @@ jobs:
         env:
           LAVLAB_TARGET: linux-x86_64
           LAVLAB_PREBUILT_DIST: prebuilt/dist
+
+      - name: Assert wheel is below PyPI's file-size limit
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          wheels = list(Path("dist").glob("*.whl"))
+          if not wheels:
+              raise SystemExit("no wheel was built")
+          for wheel in wheels:
+              size = wheel.stat().st_size
+              print(f"{wheel}: {size / 1_000_000:.1f} MB")
+              if size >= 100_000_000:
+                  raise SystemExit(f"{wheel} exceeds PyPI's 100 MB file limit")
+          PY
 
       - name: Log in to GHCR
         if: startsWith(github.ref, 'refs/tags/') && matrix.python-version == '3.11'

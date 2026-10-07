@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026-present LavLab <domurphy@mcw.edu>
 #
 # SPDX-License-Identifier: MIT
-"""Build the standalone Nuitka executable with OMERO's dynamic Ice modules."""
+"""Build the Nuitka onefile executable with OMERO's dynamic Ice modules."""
 
 from __future__ import annotations
 
@@ -86,19 +86,19 @@ def native_target() -> str:
     return detected
 
 
-def normalize_binary_name(dist_dir: Path) -> Path:
-    """Give Nuitka's platform-suffixed executable the stable launcher name."""
-    binary = dist_dir / "lavlab-bin"
+def normalize_binary_name(output_dir: Path) -> Path:
+    """Give Nuitka's onefile executable the stable launcher name."""
+    binary = output_dir / "lavlab-bin"
     if binary.is_file():
         return binary
 
-    suffixed_binary = dist_dir / "lavlab-bin.bin"
+    suffixed_binary = output_dir / "lavlab-bin.bin"
     if suffixed_binary.is_file():
         suffixed_binary.rename(binary)
         return binary
 
     raise RuntimeError(
-        f"Nuitka did not produce the expected executable in {dist_dir} "
+        f"Nuitka did not produce the expected onefile executable in {output_dir} "
         "(lavlab-bin or lavlab-bin.bin)."
     )
 
@@ -113,81 +113,38 @@ def omero_ice_modules() -> list[str]:
     return sorted(modules)
 
 
-def restore_unpatched_vips(dist_dir: Path) -> None:
-    """Undo Nuitka's RPATH rewrite of pyvips' bundled libvips.
-
-    Nuitka runs ``patchelf --set-rpath '$ORIGIN'`` over every shared object it
-    bundles. On Linux that rewrite corrupts pyvips' statically linked libvips:
-    the patched library segfaults inside its ELF constructor as soon as
-    anything dlopens it, which takes down every command that imports pyvips.
-    Copying the pristine wheel copy back over Nuitka's patched one fixes it.
-    Dropping the RPATH costs nothing: libvips links only against system
-    libraries (libc, libstdc++, libm, libdl, libpthread, libgcc_s, libresolv),
-    so it has nothing to resolve out of the dist directory in the first place.
-
-    macOS is unaffected. Nuitka rewrites ``libvips.42.dylib`` there too, but
-    the Mach-O rewrite produces a library that still loads, so this is a
-    deliberate no-op on Darwin rather than an unhandled platform.
-    """
-    if sys.platform == "darwin":
-        print("Skipping libvips restore: macOS rewrite is not corrupting.")
-        return
-
-    patched = sorted(dist_dir.glob("libvips*.so.*"))
-    if not patched:
-        return
-
-    # pyvips[binary] has shipped its libraries under both names.
-    pristine = [
-        path
-        for search_path in map(Path, sys.path)
-        if search_path.is_dir()
-        for libs_dir in ("pyvips_binary.libs", "pyvips.libs")
-        for path in search_path.glob(f"{libs_dir}/libvips*.so.*")
-    ]
-    if not pristine:
-        # Failing loudly matters here: silently shipping the patched library is
-        # exactly the bug this function exists to prevent, and a corrupt
-        # libvips only shows up as a crash at runtime on the user's machine.
-        raise RuntimeError(
-            f"Nuitka bundled {patched[0].name} but no pristine copy was found in "
-            "pyvips_binary.libs/ or pyvips.libs/ to restore it from. Refusing to "
-            "ship a libvips that patchelf may have corrupted."
-        )
-
-    by_name = {path.name: path for path in pristine}
-    for target in patched:
-        source = by_name.get(target.name, pristine[0])
-        shutil.copy2(source, target)
-        print(f"Restored unpatched {target.name} from {source}")
-
-
-def main() -> None:
+def build_onefile(project_dir: Path, output_dir: Path) -> Path:
+    """Compile the application to one self-contained Nuitka executable."""
     native_target()
     if sys.version_info[:2] != (3, 12):
-        raise RuntimeError("The standalone binary must be compiled with Python 3.12.")
+        raise RuntimeError("The onefile binary must be compiled with Python 3.12.")
 
-    project_dir = Path(__file__).parent
-    output_dir = Path(os.environ.get("LAVLAB_OUTPUT_DIR", project_dir / "native"))
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # A previous `setup.py bdist_wheel` stages its dist under the package, and
-    # --include-package-data=lavlab would sweep it into this build (Nuitka then
-    # dies resolving the stale copy's dylibs). setup.py clears it the same way.
-    staged_dist = project_dir / "src" / "lavlab" / "bin" / "dist"
-    if staged_dist.exists():
-        shutil.rmtree(staged_dist)
+    for stale in (
+        output_dir / "lavlab-bin",
+        output_dir / "lavlab-bin.bin",
+        output_dir / "lavlab.dist",
+        output_dir / "lavlab.onefile-build",
+        output_dir / "__main__.dist",
+        output_dir / "__main__.onefile-build",
+    ):
+        if stale.is_dir():
+            shutil.rmtree(stale)
+        elif stale.exists():
+            stale.unlink()
 
     command = [
         sys.executable,
         "-m",
         "nuitka",
-        "--standalone",
+        "--onefile",
         "--assume-yes-for-downloads",
         f"--output-dir={output_dir}",
         "--output-filename=lavlab-bin",
         "--include-package=lavlab",
         "--include-package-data=lavlab",
+        "--include-package-data=highdicom",
+        f"--user-plugin={project_dir / 'nuitka_plugin.py'}",
         "--noinclude-pytest-mode=nofollow",
         "--noinclude-setuptools-mode=nofollow",
         "--noinclude-custom-mode=unittest:error",
@@ -208,18 +165,23 @@ def main() -> None:
     if extra_args:
         command[3:3] = extra_args.split()
 
-    # src layout: --include-package=lavlab resolves through sys.path, and
-    # the repo root (the cwd) no longer contains the package.
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(
         filter(None, [str(project_dir / "src"), env.get("PYTHONPATH")])
     )
-
     print(f"Including {len(omero_ice_modules())} generated OMERO Ice modules.")
     subprocess.run(command, check=True, env=env)
-    dist_dir = output_dir / "__main__.dist"
-    normalize_binary_name(dist_dir)
-    restore_unpatched_vips(dist_dir)
+    return normalize_binary_name(output_dir)
+
+
+def main() -> None:
+    project_dir = Path(__file__).parent
+    output_dir = Path(os.environ.get("LAVLAB_OUTPUT_DIR", project_dir / "native"))
+    staged_dist = project_dir / "src" / "lavlab" / "bin" / "dist"
+    if staged_dist.exists():
+        shutil.rmtree(staged_dist)
+    binary = build_onefile(project_dir, output_dir)
+    print(f"Built onefile executable: {binary}")
 
 
 if __name__ == "__main__":
