@@ -39,6 +39,8 @@ jobs:
         run: |
           pip install -r build-requirements.txt
           pip install pytest pytest-cov "coverage[toml]>=6.2"
+          sudo apt-get update
+          sudo apt-get install -y libvips-dev
 
       - name: Run pytest and generate coverage report
         run: |
