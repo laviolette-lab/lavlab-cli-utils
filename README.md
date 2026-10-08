@@ -37,7 +37,7 @@ you're using:
   compiled ahead of time with [Nuitka](https://nuitka.net). The small
   `lavlab` launcher only starts that bundled executable; it never falls back
   to running the Python CLI. No `omero-py` or Ice bindings are needed on the
-  machine running it.
+  machine running it; image-processing commands do require system libvips.
 - **Source checkout** (development): `python -m lavlab ...` runs the real
   Python CLI directly (`src/lavlab/__main__.py` -> `src/lavlab/cli.py`). This is
   what you use while developing, and it needs the full dependency stack
@@ -52,6 +52,13 @@ just want the `lavlab` command):
 pip install lavlab_cli_utils-<version>-<platform>.whl
 lavlab --help
 ```
+
+Commands that process images require the system libvips library, whether you
+use the compiled wheel or run from source. Install it with macOS
+`brew install vips`, Ubuntu 24.04+ `sudo apt install libvips-dev`, Debian
+`sudo apt install libvips-dev`, Fedora/RHEL `sudo dnf install vips`, or Arch
+Linux `sudo pacman -S libvips`. If libvips is missing, `lavlab` prints the
+matching installation commands when a command first needs it.
 
 The wheel at the moment can be found in dist and the file is there. Or
 in the actions menu there are builds there that are automatically made
@@ -652,8 +659,9 @@ compiled binary without a full wheel) to compile `src/lavlab/__main__.py` into
 a Nuitka onefile executable, bundled into the wheel as
 `lavlab/bin/dist/lavlab-bin`. The console-script just execs that executable.
 The onefile bootstrap fix in `nuitka_plugin.py` preserves nonzero exit status
-when its child is killed by a signal; the same plugin restores Linux libvips
-before Nuitka packs the payload. The `.github/workflows/build.yml` workflow
+when its child is killed by a signal. Linux builds strip debug and unused
+symbols from bundled ELF files; libvips is provided by the system at runtime.
+The `.github/workflows/build.yml` workflow
 builds each platform's executable once using
 Python 3.12, then packages and smoke-tests it with Python 3.11 through 3.14.
 The workflow rejects builds on Intel macOS and non-x86_64 Linux. See

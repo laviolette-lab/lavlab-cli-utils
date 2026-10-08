@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026-present LavLab <domurphy@mcw.edu>
 #
 # SPDX-License-Identifier: MIT
-"""Nuitka hooks for preserving Linux libvips and onefile exit statuses."""
+"""Nuitka hooks for compact Linux binaries and onefile exit statuses."""
 
 from __future__ import annotations
 
@@ -17,39 +17,21 @@ class LavlabNuitkaPlugin(NuitkaPluginBase):
     plugin_name = "lavlab-nuitka"
 
     def onStandaloneDistributionFinished(self, dist_dir: str) -> None:  # noqa: N802
-        """Restore the pristine pyvips libvips before Nuitka packs onefile."""
+        """Remove unused data and debug symbols before Nuitka packs onefile."""
+        dist_path = Path(dist_dir)
+        for libvips in dist_path.rglob("libvips*"):
+            if libvips.is_file():
+                libvips.unlink()
+
         if not sys.platform.startswith("linux"):
             return
 
-        dist_path = Path(dist_dir)
         for unused_data in (
             dist_path / "skimage" / "data",
             dist_path / "pydicom" / "data" / "test_files",
         ):
             if unused_data.is_dir():
                 shutil.rmtree(unused_data)
-
-        patched = sorted(dist_path.glob("libvips*.so.*"))
-        if patched:
-            pristine = [
-                path
-                for search_path in map(Path, sys.path)
-                if search_path.is_dir()
-                for libs_dir in ("pyvips_binary.libs", "pyvips.libs")
-                for path in search_path.glob(f"{libs_dir}/libvips*.so.*")
-            ]
-            if not pristine:
-                raise RuntimeError(
-                    f"Nuitka bundled {patched[0].name} but no pristine copy was found in "
-                    "pyvips_binary.libs/ or pyvips.libs/. Refusing to ship a possibly "
-                    "corrupted libvips."
-                )
-
-            by_name = {path.name: path for path in pristine}
-            for target in patched:
-                source = by_name.get(target.name, pristine[0])
-                shutil.copy2(source, target)
-                print(f"Restored unpatched {target.name} from {source}")  # noqa: T201
 
         for path in dist_path.rglob("*"):
             if not path.is_file():

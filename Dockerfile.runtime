@@ -1,4 +1,6 @@
 FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends libvips \
+	&& rm -rf /var/lib/apt/lists/*
 # The runtime image carries Nuitka's self-contained onefile executable.
 COPY lavlab-dist /opt/lavlab
 RUN chmod +x /opt/lavlab/lavlab-bin

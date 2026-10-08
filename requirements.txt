@@ -9,7 +9,7 @@
 # installed separately first, from the lab's approved direct URL. It is not
 # on PyPI and cannot be listed here.
 numpy
-pyvips[binary]
+pyvips
 tifffile
 scikit-image
 PyYAML

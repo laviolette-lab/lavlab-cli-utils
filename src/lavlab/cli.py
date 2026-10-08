@@ -20,6 +20,20 @@ import sys
 from lavlab.commands import geojson, lr, meta, roi_cmd, seg, tile
 
 
+def _libvips_install_hint() -> str:
+    if sys.platform == "darwin":
+        return "Install libvips with Homebrew: brew install vips"
+    if sys.platform.startswith("linux"):
+        return (
+            "Install libvips with your system package manager:\n"
+            "  Ubuntu 24.04+: sudo apt update && sudo apt install libvips\n"
+            "  Debian:        sudo apt update && sudo apt install libvips\n"
+            "  Fedora/RHEL:   sudo dnf install vips\n"
+            "  Arch Linux:    sudo pacman -S libvips"
+        )
+    return "Install the libvips system library for your platform and try again."
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lavlab", description="LAVLab OMERO CLI utilities."
@@ -59,7 +73,17 @@ def main(argv: list[str] | None = None) -> None:
         datefmt="%H:%M:%S",
     )
 
-    args.handler(args)
+    try:
+        args.handler(args)
+    except OSError as exc:
+        if "libvips" not in str(exc).lower():
+            raise
+        print(
+            f"error: could not load the libvips system library: {exc}\n"
+            f"{_libvips_install_hint()}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

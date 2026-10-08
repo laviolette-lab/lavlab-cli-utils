@@ -25,6 +25,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install libvips
+        run: brew install vips
+
       - name: Restore Nuitka ccache
         uses: actions/cache@v4
         with:
@@ -113,8 +116,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install gcc/build tooling
-        run: sudo apt-get update && sudo apt-get install -y build-essential ccache
+      - name: Install gcc/build tooling and libvips
+        run: sudo apt-get update && sudo apt-get install -y build-essential ccache libvips-dev
 
       - name: Restore Nuitka ccache
         uses: actions/cache@v4
