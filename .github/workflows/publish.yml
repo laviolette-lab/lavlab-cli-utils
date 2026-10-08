@@ -28,7 +28,7 @@ jobs:
       # Each Python packaging leg produces the same py3-none platform wheel;
       # publish the copy tested with 3.11 (the minimum supported interpreter).
       - name: Download macOS wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: lavlab-wheel-py3.11
           path: dist/
@@ -36,7 +36,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download Linux wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: lavlab-wheel-linux-py3.11
           path: dist/
