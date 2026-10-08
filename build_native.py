@@ -135,7 +135,7 @@ def build_onefile(project_dir: Path, output_dir: Path) -> Path:
 
     # Keep LTO enabled for the compact onefile binary, but cap macOS
     # parallelism to avoid multiplying peak linker memory use.
-    jobs = max(1, (os.cpu_count() or 2) - 1)
+    jobs = min(max(1, (os.cpu_count() or 2) - 1), 12)
     if sys.platform == "darwin":
         jobs = min(jobs, 2)
 
