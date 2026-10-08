@@ -12,10 +12,9 @@ permissions:
 jobs:
   build-macos-native:
     name: Build macOS arm64 native binary (Python 3.12)
-    # Apple Silicon larger runner; LTO of the full Ice module set exceeds
-    # memory on the standard macOS runner.
-    runs-on: macos-14-xlarge
-    timeout-minutes: 180
+    # self-hosted macOS runners are required for building the native binary because lto OOMs
+    runs-on: ["self-hosted", "macOS", "ARM64"]
+    timeout-minutes: 240
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
