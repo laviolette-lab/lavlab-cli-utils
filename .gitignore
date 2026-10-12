@@ -96,3 +96,5 @@ credentials*.json
 omero_user.txt
 secrets*.yaml
 secrets*.yml
+
+/*_mr
