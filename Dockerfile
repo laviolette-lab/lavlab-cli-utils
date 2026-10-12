@@ -32,7 +32,7 @@
 # .` here) -- it's mounted at run time so you don't have to rebuild the
 # image after every source change, only after a dependency change.
 
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
