@@ -598,7 +598,8 @@ Local file conversion; neither direction talks to OMERO.
 
 `dcm2nii` splits a DICOM SEG object into one NIfTI file per segment,
 aligned to a reference NIfTI image, named
-`<reference-stem>_<segment-name>.nii.gz`.
+`<reference-stem>_<segment-number>_<segment-name>.nii.gz`. Including the
+DICOM segment number keeps outputs distinct when segments share a name.
 
 `nii2dcm` writes a NIfTI label mask back out as a DICOM SEG object.
 Because a NIfTI file carries no patient/study/geometry metadata of its

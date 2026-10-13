@@ -60,7 +60,12 @@ def _safe_path_component(text: str) -> str:
     return cleaned or "segment"
 
 
-def format_output_path(output_dir: str, nii_name: str, seg_name: str) -> str:
+def format_output_path(
+    output_dir: str,
+    nii_name: str,
+    seg_name: str,
+    segment_number: int | None = None,
+) -> str:
     """Format the output path for one segment's NIfTI file.
 
     :param output_dir: destination directory
@@ -69,11 +74,14 @@ def format_output_path(output_dir: str, nii_name: str, seg_name: str) -> str:
     :type nii_name: str
     :param seg_name: the segment's name
     :type seg_name: str
+    :param segment_number: optional DICOM segment number to disambiguate names
+    :type segment_number: int | None
     :return: the formatted output path
     :rtype: str
     """
+    number = f"{segment_number}_" if segment_number is not None else ""
     return os.path.join(
-        output_dir, f"{nii_name}_{_safe_path_component(seg_name)}.nii.gz"
+        output_dir, f"{nii_name}_{number}{_safe_path_component(seg_name)}.nii.gz"
     )
 
 
@@ -98,23 +106,23 @@ def get_affine_from_nifti(image: SpatialImage) -> np.ndarray:
     return np.asarray(image.affine)
 
 
-def _get_dicom_seg_affine(seg_data: pydicom.Dataset) -> np.ndarray | None:
-    """Read the DICOM SEG's first-frame geometry, if it is available."""
+def _get_dicom_seg_affine(
+    seg_data: pydicom.Dataset, source_uids: list[str] | None = None
+) -> np.ndarray | None:
+    """Read DICOM SEG geometry in the source-stack voxel order."""
     per_frame = getattr(seg_data, "PerFrameFunctionalGroupsSequence", [])
     shared = getattr(seg_data, "SharedFunctionalGroupsSequence", [])
-    groups = [*per_frame[:1], *shared[:1]]
 
     def first_item(sequence_name: str):
-        for group in groups:
+        for group in [*per_frame[:1], *shared[:1]]:
             sequence = getattr(group, sequence_name, None)
             if sequence:
                 return sequence[0]
         return None
 
     orientation = first_item("PlaneOrientationSequence")
-    position = first_item("PlanePositionSequence")
     measures = first_item("PixelMeasuresSequence")
-    if orientation is None or position is None or measures is None:
+    if orientation is None or measures is None:
         return None
 
     iop = np.asarray(orientation.ImageOrientationPatient, dtype=float)
@@ -128,12 +136,57 @@ def _get_dicom_seg_affine(seg_data: pydicom.Dataset) -> np.ndarray | None:
         getattr(measures, "SpacingBetweenSlices", None)
         or getattr(measures, "SliceThickness", 1.0)
     )
+    slice_step = slice_direction * slice_spacing
+    first_position = None
+    if source_uids:
+        indexes, positions = [], []
+        uid_indexes = {uid: index for index, uid in enumerate(source_uids)}
+        for group in per_frame:
+            position = getattr(group, "PlanePositionSequence", None)
+            derivation = getattr(group, "DerivationImageSequence", None)
+            if not position or not derivation:
+                continue
+            source_images = getattr(derivation[0], "SourceImageSequence", None)
+            if not source_images:
+                continue
+            index = uid_indexes.get(source_images[0].ReferencedSOPInstanceUID)
+            if index is not None:
+                indexes.append(index)
+                positions.append(
+                    np.asarray(position[0].ImagePositionPatient, dtype=float)
+                )
+        if indexes and len(set(indexes)) > 1:
+            design = np.column_stack(
+                (np.asarray(indexes, dtype=float), np.ones(len(indexes)))
+            )
+            slice_step, first_position = np.linalg.lstsq(
+                design, np.asarray(positions), rcond=None
+            )[0]
+
+    if first_position is None:
+        position = first_item("PlanePositionSequence")
+        if position is None:
+            return None
+        first_position = np.asarray(position.ImagePositionPatient, dtype=float)
+        if source_uids and per_frame:
+            derivation = getattr(per_frame[0], "DerivationImageSequence", None)
+            source_images = (
+                getattr(derivation[0], "SourceImageSequence", None)
+                if derivation
+                else None
+            )
+            if source_images:
+                source_index = uid_indexes.get(
+                    source_images[0].ReferencedSOPInstanceUID
+                )
+                if source_index is not None:
+                    first_position -= slice_step * source_index
 
     affine_lps = np.eye(4)
     affine_lps[:3, 0] = row_direction * pixel_spacing[1]
     affine_lps[:3, 1] = column_direction * pixel_spacing[0]
-    affine_lps[:3, 2] = slice_direction * slice_spacing
-    affine_lps[:3, 3] = np.asarray(position.ImagePositionPatient, dtype=float)
+    affine_lps[:3, 2] = slice_step
+    affine_lps[:3, 3] = first_position
 
     # DICOM patient coordinates are LPS; NIfTI affine world coordinates are RAS.
     lps_to_ras = np.diag([-1.0, -1.0, 1.0, 1.0])
@@ -151,12 +204,12 @@ def _flip_affine_axis(affine: np.ndarray, axis: int, length: int) -> np.ndarray:
 def flip_based_on_affine(
     seg_data: np.ndarray, seg_affine: np.ndarray, ref_affine: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Flip the first two voxel axes when SEG and reference orientations differ."""
+    """Flip voxel axes when SEG and reference orientations differ."""
     source_codes = nib.aff2axcodes(seg_affine)
     reference_codes = nib.aff2axcodes(ref_affine)
     affine = np.asarray(seg_affine).copy()
 
-    for axis in (0, 1):
+    for axis in range(3):
         if source_codes[axis] != reference_codes[axis]:
             seg_data = np.flip(seg_data, axis=axis)
             affine = _flip_affine_axis(affine, axis, seg_data.shape[axis])
@@ -167,12 +220,8 @@ def flip_based_on_affine(
 def format_nifti(
     seg_data: np.ndarray, seg_affine: np.ndarray, ref_affine: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Orient DICOM SEG voxels and geometry to match NIfTI conventions."""
-    seg_data, affine = flip_based_on_affine(seg_data, seg_affine, ref_affine)
-    # DICOM SEG frame order uses the opposite z indexing from NIfTI.
-    seg_data = np.flip(seg_data, axis=2)
-    affine = _flip_affine_axis(affine, 2, seg_data.shape[2])
-    return seg_data, affine
+    """Orient DICOM SEG voxels and geometry to match the reference NIfTI."""
+    return flip_based_on_affine(seg_data, seg_affine, ref_affine)
 
 
 def write_nifti(
@@ -185,7 +234,11 @@ def write_nifti(
     output_header = header.copy() if header is not None else None
     if output_header is not None:
         output_header.set_data_dtype(data.dtype)
-    nib.save(nib.Nifti1Image(data, affine, header=output_header), nii_path)
+    image = nib.Nifti1Image(data, affine, header=output_header)
+    if output_header is not None:
+        image.set_qform(affine, code=int(output_header["qform_code"]))
+        image.set_sform(image.get_qform(), code=int(output_header["sform_code"]))
+    nib.save(image, nii_path)
 
 
 def split_seg_channels(
@@ -233,9 +286,11 @@ def dcmseg_to_nifti(dicom_seg_path: str, nii_path: str, output_dir: str) -> list
 
     dicom_seg = read_seg(dicom_seg_path)  # pixel channels are (z, y, x)
     nii = read_nii(nii_path)  # nibabel voxel arrays are (x, y, z)
+    source_uids = [item[2] for item in dicom_seg.get_source_image_uids()]
     if len(nii.shape) != 3:
         raise ValueError(f"reference NIfTI must be 3D, got shape {nii.shape}")
-    seg_affine = _get_dicom_seg_affine(dicom_seg)
+    reference_affine = get_affine_from_nifti(nii)
+    seg_affine = _get_dicom_seg_affine(dicom_seg, source_uids)
     if seg_affine is None:
         log.info(
             "DICOM SEG geometry is unavailable; using the reference NIfTI's geometry."
@@ -247,7 +302,19 @@ def dcmseg_to_nifti(dicom_seg_path: str, nii_path: str, output_dir: str) -> list
     }
 
     out_paths = []
+    nii_basename = Path(nii_path).name
+    for suffix in (".nii.gz", ".nii"):
+        if nii_basename.lower().endswith(suffix):
+            nii_basename = nii_basename[: -len(suffix)]
+            break
+
     for segment_number, seg_channel in split_seg_channels(dicom_seg):
+        segment = segments_by_number.get(segment_number)
+        if segment is None:
+            raise ValueError(
+                f"DICOM SEG has no SegmentSequence entry for segment number "
+                f"{segment_number}"
+            )
         nii_data = np.transpose(seg_channel, (2, 1, 0))
         if nii_data.shape != nii.shape[:3]:
             raise ValueError(
@@ -255,17 +322,12 @@ def dcmseg_to_nifti(dicom_seg_path: str, nii_path: str, output_dir: str) -> list
                 f"NIfTI size {nii.shape[:3]}"
             )
         nii_data, output_affine = format_nifti(
-            nii_data, seg_affine, get_affine_from_nifti(nii)
+            nii_data, seg_affine, reference_affine
         )
-        segment = segments_by_number.get(segment_number)
-        if segment is None:
-            raise ValueError(
-                f"DICOM SEG has no SegmentSequence entry for segment number "
-                f"{segment_number}"
-            )
         nii_code = segment.SegmentedPropertyTypeCodeSequence[0].CodeMeaning
-        nii_basename = os.path.basename(nii_path).split(".")[0]
-        channel_output_path = format_output_path(output_dir, nii_basename, nii_code)
+        channel_output_path = format_output_path(
+            output_dir, nii_basename, nii_code, segment_number
+        )
         write_nifti(nii_data, output_affine, channel_output_path, nii.header)
         out_paths.append(channel_output_path)
 

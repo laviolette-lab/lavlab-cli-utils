@@ -115,9 +115,14 @@ def test_nifti_to_dcmseg_round_trips_through_dcmseg_to_nifti(tmp_path):
     out_paths = dcmseg_to_nifti(str(seg_path), str(mask_path), str(out_dir))
     assert len(out_paths) == 1
 
-    recovered_xyz = np.asanyarray(nib.load(out_paths[0]).dataobj)
+    recovered_image = nib.load(out_paths[0])
+    recovered_xyz = np.asanyarray(recovered_image.dataobj)
     recovered = recovered_xyz.transpose(2, 1, 0)
     assert np.array_equal(recovered > 0, mask > 0)
+    assert np.allclose(recovered_image.affine, nib.load(str(mask_path)).affine)
+    direction = recovered_image.affine[:3, :3]
+    direction /= np.linalg.norm(direction, axis=0)
+    assert np.allclose(direction.T @ direction, np.eye(3), atol=1e-6)
 
 
 def test_onefile_binary_seg_conversions_when_configured(tmp_path):
@@ -175,6 +180,11 @@ def test_format_output_path():
     assert path == "/out/case01_Prostate.nii.gz"
 
 
+def test_format_output_path_disambiguates_segment_number():
+    path = format_output_path("/out", "case01", "Mass", 2)
+    assert path == "/out/case01_2_Mass.nii.gz"
+
+
 def test_format_output_path_sanitizes_unsafe_segment_name():
     # A DICOM CodeMeaning can contain slashes/parens/etc.; those must not
     # land in the path as literal separators (an unintended nested dir)
@@ -214,6 +224,18 @@ def test_flip_based_on_affine_reverses_mismatched_axis_and_updates_affine():
     flipped, affine = flip_based_on_affine(data, source_affine, ref.affine)
 
     assert np.array_equal(flipped, np.flip(data, axis=0))
+    assert nib.aff2axcodes(affine) == nib.aff2axcodes(ref.affine)
+
+
+def test_flip_based_on_affine_reverses_through_plane_axis():
+    ref = _image()
+    source_affine = ref.affine.copy()
+    source_affine[2, 2] *= -1
+    data = np.arange(4 * 4 * 2).reshape((4, 4, 2))
+
+    flipped, affine = flip_based_on_affine(data, source_affine, ref.affine)
+
+    assert np.array_equal(flipped, np.flip(data, axis=2))
     assert nib.aff2axcodes(affine) == nib.aff2axcodes(ref.affine)
 
 
