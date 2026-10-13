@@ -321,9 +321,7 @@ def dcmseg_to_nifti(dicom_seg_path: str, nii_path: str, output_dir: str) -> list
                 f"segmentation size {nii_data.shape} does not match "
                 f"NIfTI size {nii.shape[:3]}"
             )
-        nii_data, output_affine = format_nifti(
-            nii_data, seg_affine, reference_affine
-        )
+        nii_data, output_affine = format_nifti(nii_data, seg_affine, reference_affine)
         nii_code = segment.SegmentedPropertyTypeCodeSequence[0].CodeMeaning
         channel_output_path = format_output_path(
             output_dir, nii_basename, nii_code, segment_number
