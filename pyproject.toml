@@ -1,20 +1,20 @@
 [build-system]
 requires = [
-    # >=77 for the SPDX `license = "MIT"` string below.
-    "setuptools>=77",
-    "wheel",
-    "Nuitka>=2.0",
-    "numpy",
-    "pyvips",
-    "tifffile",
-    "imagecodecs",
-    "scikit-image",
-    "PyYAML",
-    "tqdm",
-    "omero-py",
-    "highdicom",
-    "nibabel",
-    "pydicom",
+  # >=77 for the SPDX `license = "MIT"` string below.
+  "setuptools>=77",
+  "wheel",
+  "Nuitka>=2.0",
+  "numpy",
+  "pyvips",
+  "tifffile",
+  "imagecodecs",
+  "scikit-image",
+  "PyYAML",
+  "tqdm",
+  "omero-py",
+  "highdicom",
+  "nibabel",
+  "pydicom",
 ]
 # Not hatchling: setup.py's build_py stages or compiles the Nuitka onefile
 # binary into the wheel. Hatch is used only for the dev environments below.
@@ -28,7 +28,16 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE.txt"]
-keywords = ["omero", "microscopy", "pathology", "qupath", "geojson", "dicom-seg", "nifti", "cli"]
+keywords = [
+  "omero",
+  "microscopy",
+  "pathology",
+  "qupath",
+  "geojson",
+  "dicom-seg",
+  "nifti",
+  "cli",
+]
 authors = [{ name = "Donovan Murphy", email = "domurphy@mcw.edu" }]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -51,18 +60,18 @@ dependencies = []
 # Everything needed to run `python -m lavlab ...` from a source checkout,
 # without waiting on a Nuitka build. Mirrors build-requirements.txt.
 dev = [
-    "numpy",
-    "pyvips",
-    "tifffile",
-    "imagecodecs",
-    "scikit-image",
-    "PyYAML",
-    "tqdm",
-    "omero-py",
-    "highdicom",
-    "nibabel",
-    "pydicom",
-    "pytest",
+  "numpy",
+  "pyvips",
+  "tifffile",
+  "imagecodecs",
+  "scikit-image",
+  "PyYAML",
+  "tqdm",
+  "omero-py",
+  "highdicom",
+  "nibabel",
+  "pydicom",
+  "pytest",
 ]
 
 [project.scripts]
@@ -82,17 +91,17 @@ include = ["lavlab*"]
 
 [tool.setuptools.package-data]
 # bin/dist contains the Nuitka --onefile executable.
-lavlab = ["py.typed", "data/*.yaml", "data/*.json", "bin/dist/*", "bin/dist/**/*"]
-
-[tool.hatch.env]
-requires = ["uv"]
+lavlab = [
+  "py.typed",
+  "data/*.yaml",
+  "data/*.json",
+  "bin/dist/*",
+  "bin/dist/**/*",
+]
 
 [tool.hatch.envs.default]
 installer = "uv"
 type = "virtual"
-# Never install the project into Hatch envs: setuptools' editable install runs
-# setup.py's build_py, which would kick off a full Nuitka compile. Tests import
-# from src/ via [tool.pytest.ini_options] pythonpath instead.
 skip-install = true
 dependencies = []
 
@@ -207,7 +216,7 @@ ignore = [
 ]
 "src/lavlab/cli.py" = ["T20"]
 "src/lavlab/commands/*" = ["T20"]
-"*" = ["E501"]              # Ignore line length for all files
+"*" = ["E501"] # Ignore line length for all files
 
 [tool.ruff.lint.isort]
 known-first-party = ["lavlab"]
