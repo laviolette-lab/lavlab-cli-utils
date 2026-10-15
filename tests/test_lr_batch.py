@@ -15,7 +15,8 @@ import argparse
 
 import pytest
 
-from lavlab.commands.lr import _summarise_batch, _validate_args
+from lavlab.cli import build_parser
+from lavlab.commands.lr import _keep_existing, _summarise_batch, _validate_args
 
 
 def _ok(image_id, tier="local"):
@@ -161,3 +162,47 @@ def test_max_failed_rejects_negative():
 
 def test_max_failed_zero_is_accepted_in_batch_mode():
     _validate_args(_args(max_failed=0))
+
+
+# --- existing output files ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("override", "regenerate", "kept"),
+    [
+        (False, False, True),
+        (True, False, False),
+        # Regenerating and then skipping the write would do nothing at all.
+        (False, True, False),
+    ],
+)
+def test_existing_output_kept_unless_override_or_regenerate(
+    tmp_path, override, regenerate, kept
+):
+    existing = tmp_path / "LR10_slide.jp2"
+    existing.write_bytes(b"old")
+
+    args = _args(override=override, regenerate=regenerate)
+
+    assert _keep_existing(args, str(existing)) is kept
+
+
+def test_missing_output_is_never_kept(tmp_path):
+    assert not _keep_existing(_args(override=False), str(tmp_path / "absent.jp2"))
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["lr", "12345", "--regenerate", "--override"],
+        ["--override", "lr", "12345", "--regenerate"],
+    ],
+    ids=["after the command", "before the command"],
+)
+def test_override_accepted_on_either_side_of_the_command(argv):
+    assert build_parser().parse_args(argv).override is True
+
+
+@pytest.mark.parametrize("command", [["lr", "1"], ["roi", "1", "--all"]])
+def test_override_defaults_off(command):
+    assert build_parser().parse_args(command).override is False

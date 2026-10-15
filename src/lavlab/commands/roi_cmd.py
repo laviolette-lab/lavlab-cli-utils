@@ -19,6 +19,7 @@ from lavlab.commands._shared import (
     add_creds_args,
     add_downsample_arg,
     add_fs_map_arg,
+    add_override_arg,
     connect_from_args,
     ensure_parent_dir,
     group_of,
@@ -121,6 +122,10 @@ def add_parser(subparsers) -> None:
         default=8,
         metavar="N",
         help="batch only: images processed in parallel (default: 8).",
+    )
+    add_override_arg(
+        parser,
+        "Replace the output file if it already exists (default: skip the image).",
     )
 
     add_creds_args(parser)

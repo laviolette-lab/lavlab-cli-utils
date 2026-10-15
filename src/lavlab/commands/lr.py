@@ -19,6 +19,7 @@ from lavlab.commands._shared import (
     add_creds_args,
     add_downsample_arg,
     add_fs_map_arg,
+    add_override_arg,
     connect_from_args,
     group_of,
     load_fs_map_from_args,
@@ -102,6 +103,12 @@ def add_parser(subparsers) -> None:
         "--downsample and --format, without downloading it. Handy for filling "
         "the gaps in a whole group. Can't be combined with --regenerate.",
     )
+    add_override_arg(
+        parser,
+        "Replace the local output file if it already exists (default: skip "
+        "the image). The large recon itself still comes from OMERO when one "
+        "is attached; use --regenerate to rebuild it.",
+    )
 
     add_creds_args(parser)
 
@@ -109,9 +116,8 @@ def add_parser(subparsers) -> None:
     advanced.add_argument(
         "--regenerate",
         action="store_true",
-        help="Ignore any large recon already in OMERO: build a fresh one and "
-        "re-upload it. If the local file also exists, add the global "
-        "--override (lavlab --override lr ...) to replace it too.",
+        help="Ignore any large recon already in OMERO: build a fresh one, "
+        "re-upload it, and replace the local file (implies --override).",
     )
     advanced.add_argument(
         "--skip-upload",
@@ -162,6 +168,15 @@ def _validate_args(args: argparse.Namespace) -> None:
             )
         if args.max_failed < 0:
             raise SystemExit("error: --max-failed must be zero or greater.")
+
+
+def _keep_existing(args: argparse.Namespace, output_path: str) -> bool:
+    """Whether an output file already on disk should be left alone.
+
+    --regenerate implies --override: asking for a fresh recon and then
+    skipping it because an old copy is on disk would do nothing.
+    """
+    return os.path.exists(output_path) and not (args.override or args.regenerate)
 
 
 def run(args: argparse.Namespace) -> None:
@@ -218,7 +233,7 @@ def _run_single(args: argparse.Namespace, image_id: int) -> None:
             except ConfigError as exc:
                 raise SystemExit(f"error: {exc}") from None
 
-            if os.path.exists(output_path) and not args.override:
+            if _keep_existing(args, output_path):
                 print(
                     f"Already exists, skipping (use --override to replace): {output_path}"
                 )
@@ -300,7 +315,7 @@ def _process_one(image_id: int):
                     )
                     return None
 
-                if os.path.exists(output_path) and not args.override:
+                if _keep_existing(args, output_path):
                     return (image_id, output_path, None)
 
             try:

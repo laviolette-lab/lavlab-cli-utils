@@ -14,7 +14,7 @@ Apply before the subcommand name:
 
 | Flag | Meaning |
 |---|---|
-| `--override` | Write over existing output files. Default: off. |
+| `--override` | Write over existing output files. Default: off. Also accepted after the subcommand by `lr`, `roi` and `tile` (`lavlab lr 12345 --override`). |
 | `-v`, `--verbose` | Enable DEBUG-level logging (default without it: INFO). Chatty -- e.g. it logs a repr of every OMERO tile response during `lr`'s network tier, which measurably slows the fetch. Leave it off unless you're diagnosing something. |
 
 ### OMERO credential flags
@@ -51,7 +51,7 @@ lavlab lr <image-id | batch> [-o OUTPUT] [-g GROUP] [--workers N]
 | `-o`, `--output` | Output file (single mode) or directory (batch mode) |
 | `-g`, `--group` | OMERO group ID -- batch mode only |
 | `--workers` | Parallel workers for batch mode (default: 8) |
-| `--regenerate` | Skip the cached-annotation tier and force a fresh fetch, re-uploading the result |
+| `--regenerate` | Skip the cached-annotation tier and force a fresh fetch, re-uploading the result. Implies `--override`, so an existing local file is replaced |
 | `--skip-upload` | Don't write the fetched/generated result back to OMERO as an annotation |
 | `--skip-existing` | Skip images that already have a recon for this downsample+format, on a cheap existence check (no download, no regeneration). Rejected with `--regenerate` |
 | `--skip-local` | Keep no local copy: fetch/generate to a temp file, upload it, delete it. Rejected with `-o` and with `--skip-upload` |
@@ -214,7 +214,7 @@ examples.
 
 | Flag | Meaning |
 |---|---|
-| `--skip-existing` | Skip slides already tiled with these same parameters, and resume an interrupted slide from the tiles it already wrote. A finished slide tiled with different parameters is warned about and skipped; the global `--override` re-tiles it |
+| `--skip-existing` | Skip slides already tiled with these same parameters, and resume an interrupted slide from the tiles it already wrote. A finished slide tiled with different parameters is warned about and skipped; `--override` re-tiles it |
 | `--force-local` | Read a JPEG-2000 source locally instead of falling forward to the network tier |
 | `-g`, `--group` | OMERO group ID -- batch mode only |
 | `--workers` | Slides tiled in parallel in batch mode (default: 8) |

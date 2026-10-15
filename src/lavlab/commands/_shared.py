@@ -123,6 +123,19 @@ def add_creds_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_override_arg(group, help_text: str) -> None:
+    """Accept ``--override`` after the subcommand as well as before it.
+
+    The top-level parser defines it too (``lavlab --override lr ...``).
+    ``SUPPRESS`` keeps this copy from resetting a value the top-level
+    parser already set: argparse applies a subparser's defaults over the
+    parent's namespace.
+    """
+    group.add_argument(
+        "--override", action="store_true", default=argparse.SUPPRESS, help=help_text
+    )
+
+
 def add_downsample_arg(group) -> None:
     group.add_argument(
         "--downsample",

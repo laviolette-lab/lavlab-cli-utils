@@ -158,8 +158,9 @@ later run at the same downsample and format hits tier 1 instead of
 regenerating. Only an annotation matching the requested format is ever
 touched or replaced; an existing attachment in some other format (e.g. an
 older, manually-uploaded `.png`) is left alone. `--regenerate` skips the
-tier-1 lookup and forces a fresh tier-2/3 fetch, re-uploading the result;
-`--skip-upload` fetches without writing anything back to OMERO at all.
+tier-1 lookup and forces a fresh tier-2/3 fetch, re-uploading the result
+and replacing any local file already at the output path (it implies
+`--override`); `--skip-upload` fetches without writing anything back to OMERO at all.
 
 Two more flags exist for running this across a whole group:
 
@@ -431,8 +432,7 @@ Image.open("tile.jpg").getexif()[270]      # JPEG
 `tile_params.json` records every setting that affects the output;
 `--skip-existing` compares against it, so a slide tiled with *different*
 settings is warned about and skipped rather than mixing two settings in one
-directory -- the global `--override` flag (before the subcommand: `lavlab
---override tile ...`) re-tiles it. Output from an older lavlab version
+directory -- `--override` (`lavlab tile ... --override`) re-tiles it. Output from an older lavlab version
 counts as different settings.
 
 #### Where the pixels come from

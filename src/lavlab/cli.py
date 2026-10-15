@@ -47,7 +47,9 @@ Commands that talk to OMERO need a username, password, server and port. Pass
 them after the command with -u/-w/-s/-p, or set OMERO_USER, OMERO_PASSWORD,
 OMERO_HOST and OMERO_PORT once in your shell.
 
-The options above go *before* the command, e.g. 'lavlab --override lr 12345'."""
+-v goes *before* the command, e.g. 'lavlab -v lr 12345'. --override works on
+either side: 'lavlab lr 12345 --override' and 'lavlab --override lr 12345'
+do the same thing."""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -71,7 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--override",
         action="store_true",
         default=False,
-        help="Replace output files that already exist (default: skip them).",
+        help="Replace output files that already exist (default: skip them). "
+        "For lr, roi and tile; see each command's --help.",
     )
 
     subparsers = add_subcommands(parser, "command")
