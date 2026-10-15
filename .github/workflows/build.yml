@@ -79,7 +79,7 @@ jobs:
           chmod +x src/lavlab/bin/dist/lavlab-bin
           out=$(./src/lavlab/bin/dist/lavlab-bin --help) || exit 1
           [ -n "$out" ] || { echo "--help produced no output"; exit 1; }
-          case "$out" in usage:*) ;; *) echo "unexpected --help output"; exit 1 ;; esac
+          case "$out" in [Uu]sage:*) ;; *) echo "unexpected --help output"; exit 1 ;; esac
         env:
           LAVLAB_BINARY: src/lavlab/bin/dist/lavlab-bin
 
@@ -193,7 +193,7 @@ jobs:
           chmod +x src/lavlab/bin/dist/lavlab-bin
           out=$(./src/lavlab/bin/dist/lavlab-bin --help) || exit 1
           [ -n "$out" ] || { echo "--help produced no output"; exit 1; }
-          case "$out" in usage:*) ;; *) echo "unexpected --help output"; exit 1 ;; esac
+          case "$out" in [Uu]sage:*) ;; *) echo "unexpected --help output"; exit 1 ;; esac
         env:
           LAVLAB_BINARY: src/lavlab/bin/dist/lavlab-bin
 
@@ -269,7 +269,7 @@ jobs:
           /tmp/lavlab-smoke/bin/pip install dist/*.whl
           out=$(/tmp/lavlab-smoke/bin/lavlab --help) || exit 1
           [ -n "$out" ] || { echo "--help produced no output"; exit 1; }
-          case "$out" in usage:*) ;; *) echo "unexpected --help output"; exit 1 ;; esac
+          case "$out" in [Uu]sage:*) ;; *) echo "unexpected --help output"; exit 1 ;; esac
           for sub in lr roi tile geojson seg meta; do
             subout=$(/tmp/lavlab-smoke/bin/lavlab "$sub" --help) || exit 1
             [ -n "$subout" ] || { echo "$sub --help produced no output"; exit 1; }
@@ -370,7 +370,7 @@ jobs:
           /tmp/lavlab-smoke/bin/pip install dist/*.whl
           out=$(/tmp/lavlab-smoke/bin/lavlab --help) || exit 1
           [ -n "$out" ] || { echo "--help produced no output"; exit 1; }
-          case "$out" in usage:*) ;; *) echo "unexpected --help output"; exit 1 ;; esac
+          case "$out" in [Uu]sage:*) ;; *) echo "unexpected --help output"; exit 1 ;; esac
           for sub in lr roi tile geojson seg meta; do
             subout=$(/tmp/lavlab-smoke/bin/lavlab "$sub" --help) || exit 1
             [ -n "$subout" ] || { echo "$sub --help produced no output"; exit 1; }
