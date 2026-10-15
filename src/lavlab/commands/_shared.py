@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: 2026-present LavLab <domurphy@mcw.edu>
 #
 # SPDX-License-Identifier: MIT
-"""Shared helpers for the ``lr`` and ``roi`` command groups."""
+"""Shared helpers for the command modules: help layout, OMERO credential
+flags, and the connection/output plumbing ``lr`` and ``roi`` have in common."""
 
 from __future__ import annotations
 
@@ -37,23 +38,109 @@ def make_temp_path(fmt: str) -> str:
     return path
 
 
+SECTION_RULE = "=" * 22
+
+#: Shared description for TARGET on the commands that take an image or 'batch'.
+BATCH_TARGET_HELP = (
+    "An OMERO image ID, or the word 'batch' to process every image you can "
+    "see (only one group's with -g)."
+)
+
+
+class HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Help layout shared by every lavlab command.
+
+    Everyday flags come first under "Options"; any further section
+    (OMERO connection, advanced options) is set off by a rule so it reads
+    as something most runs can skip. Descriptions and epilogs keep their
+    line breaks, so they can carry short lists and examples.
+    """
+
+    _UNRULED_SECTIONS = frozenset({"Arguments", "Options", "Commands"})
+
+    def add_usage(self, usage, actions, groups, prefix=None):
+        super().add_usage(
+            usage, actions, groups, "Usage: " if prefix is None else prefix
+        )
+
+    def start_section(self, heading):
+        if heading not in self._UNRULED_SECTIONS:
+            self.add_text(SECTION_RULE)
+        super().start_section(heading)
+
+    def _format_action(self, action):
+        # List subcommands directly under "Commands", without the extra
+        # "COMMAND" header line argparse puts above them.
+        if isinstance(action, argparse._SubParsersAction):
+            return "".join(self._format_action(sub) for sub in action._get_subactions())
+        return super()._format_action(action)
+
+
+def style_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Rename argparse's default sections to match :class:`HelpFormatter`."""
+    parser._positionals.title = "Arguments"
+    parser._optionals.title = "Options"
+    return parser
+
+
+def add_command(subparsers, name: str, **kwargs) -> argparse.ArgumentParser:
+    """Add a subcommand parser that uses the shared help layout."""
+    return style_parser(
+        subparsers.add_parser(name, formatter_class=HelpFormatter, **kwargs)
+    )
+
+
+def add_subcommands(parser: argparse.ArgumentParser, dest: str):
+    """Add a required, "Commands"-titled subcommand list to *parser*.
+
+    ``prog`` is passed explicitly because argparse otherwise builds each
+    subcommand's name from the parent's whole usage line.
+    """
+    return parser.add_subparsers(
+        dest=dest, required=True, title="Commands", metavar="COMMAND", prog=parser.prog
+    )
+
+
+def add_advanced_group(parser: argparse.ArgumentParser, topic: str | None = None):
+    title = "Advanced Options" + (f" ({topic})" if topic else "")
+    return parser.add_argument_group(title)
+
+
 def add_creds_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("-u", "--user", help="OMERO username (or set OMERO_USER).")
-    parser.add_argument(
+    group = parser.add_argument_group(
+        "OMERO Connection",
+        "Each flag falls back to an environment variable, so you can set them "
+        "once in your shell\n(e.g. export OMERO_USER=you) instead of typing "
+        "them on every run.",
+    )
+    group.add_argument("-u", "--user", help="OMERO username (or set OMERO_USER).")
+    group.add_argument(
         "-w", "--password", help="OMERO password (or set OMERO_PASSWORD)."
     )
-    parser.add_argument("-s", "--host", help="OMERO server host (or set OMERO_HOST).")
-    parser.add_argument(
+    group.add_argument("-s", "--host", help="OMERO server address (or set OMERO_HOST).")
+    group.add_argument(
         "-p", "--port", type=int, help="OMERO server port (or set OMERO_PORT)."
     )
 
 
-def add_common_output_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--downsample", type=int, default=10, help="Downsample factor (default: 10)."
+def add_downsample_arg(group) -> None:
+    group.add_argument(
+        "--downsample",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Shrink factor: 10 makes the output 1/10 of the full-resolution "
+        "width and height (default: 10).",
     )
-    parser.add_argument(
-        "--fs-map", dest="fs_map", help="Path to a custom fs_map YAML file."
+
+
+def add_fs_map_arg(group) -> None:
+    group.add_argument(
+        "--fs-map",
+        dest="fs_map",
+        metavar="PATH",
+        help="YAML file mapping OMERO groups to output folders, used when -o is "
+        "not given (default: the lab's bundled map).",
     )
 
 

@@ -13,8 +13,12 @@ import os
 from collections import Counter
 
 from lavlab.commands._shared import (
-    add_common_output_args,
+    BATCH_TARGET_HELP,
+    add_advanced_group,
+    add_command,
     add_creds_args,
+    add_downsample_arg,
+    add_fs_map_arg,
     connect_from_args,
     group_of,
     load_fs_map_from_args,
@@ -31,73 +35,106 @@ from lavlab.naming import resolve_output_path
 log = logging.getLogger(__name__)
 
 
+DESCRIPTION = """\
+Save a downsampled ("large recon") copy of OMERO images to disk.
+
+Each image is looked up in this order, stopping at the first that works:
+  1. a large recon already attached to the image in OMERO (fastest)
+  2. the original file, if OMERO's storage is mounted on this machine
+  3. OMERO's tile API over the network (works anywhere, slowest)
+A recon built by 2 or 3 is attached back to the image in OMERO, so the next
+pull at the same --downsample and --format is quick.
+
+Files are named LR<downsample>_<image name>.<format>, e.g. LR10_slide1.jp2."""
+
+EXAMPLES = """\
+Examples:
+  lavlab lr 12345 -o ./recons/
+  lavlab lr batch -g 3 --skip-existing --format png -o ./recons/"""
+
+
 def add_parser(subparsers) -> None:
-    parser = subparsers.add_parser(
-        "lr", help="Pull large-recon downsampled images from OMERO."
+    parser = add_command(
+        subparsers,
+        "lr",
+        help="Pull downsampled (large recon) images from OMERO.",
+        usage="%(prog)s TARGET [options]",
+        description=DESCRIPTION,
+        epilog=EXAMPLES,
+    )
+    parser.add_argument("target", metavar="TARGET", help=BATCH_TARGET_HELP)
+    parser.add_argument(
+        "-o",
+        "--output",
+        metavar="PATH",
+        help="Where to write: a file or folder for one image, a folder for "
+        "batch. Without -o the lab's fs_map picks a folder per group (one "
+        "image falls back to the current folder; batch skips images it "
+        "can't place).",
     )
     parser.add_argument(
-        "target", help="An OMERO image ID, or 'batch' to pull all images."
+        "-g",
+        "--group",
+        type=int,
+        metavar="ID",
+        help="batch only: just this OMERO group's images (default: every group "
+        "you belong to).",
     )
+    add_downsample_arg(parser)
     parser.add_argument(
-        "-o", "--output", help="Output file (single) or directory (batch)."
-    )
-    parser.add_argument(
-        "-g", "--group", type=int, help="OMERO group ID (batch mode only)."
+        "--format",
+        choices=["jp2", "jpg", "jpeg", "png", "tif", "tiff"],
+        default="jp2",
+        help="Output image format (default: jp2). An -o file name's own "
+        "extension wins. Also the format looked up in, and attached to, OMERO.",
     )
     parser.add_argument(
         "--workers",
         type=int,
         default=8,
-        help="Parallel workers for batch mode (default: 8).",
-    )
-    parser.add_argument(
-        "--regenerate",
-        action="store_true",
-        help="Ignore any existing OMERO large-recon annotation and regenerate fresh, "
-        "re-uploading the result (combine with --override to also force "
-        "regeneration when the local output file already exists).",
-    )
-    parser.add_argument(
-        "--skip-upload",
-        action="store_true",
-        help="Don't upload the generated large-recon back to OMERO as an annotation.",
-    )
-    parser.add_argument(
-        "--skip-local",
-        action="store_true",
-        help="Don't keep a local copy -- fetch/generate to a temporary file, upload it to "
-        "OMERO, then delete it. Incompatible with -o and with --skip-upload (that "
-        "combination would do nothing).",
+        metavar="N",
+        help="batch only: images processed in parallel (default: 8).",
     )
     parser.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip any image that already has a large-recon annotation for this "
-        "downsample and format, without downloading or regenerating it. Useful for "
-        "backfilling a whole group: cached images cost one cheap existence check, "
-        "only the missing ones do real work. Incompatible with --regenerate.",
+        help="Skip images that already have a large recon in OMERO at this "
+        "--downsample and --format, without downloading it. Handy for filling "
+        "the gaps in a whole group. Can't be combined with --regenerate.",
     )
-    parser.add_argument(
+
+    add_creds_args(parser)
+
+    advanced = add_advanced_group(parser)
+    advanced.add_argument(
+        "--regenerate",
+        action="store_true",
+        help="Ignore any large recon already in OMERO: build a fresh one and "
+        "re-upload it. If the local file also exists, add the global "
+        "--override (lavlab --override lr ...) to replace it too.",
+    )
+    advanced.add_argument(
+        "--skip-upload",
+        action="store_true",
+        help="Don't attach newly built large recons to the image in OMERO.",
+    )
+    advanced.add_argument(
+        "--skip-local",
+        action="store_true",
+        help="Keep no copy on disk: write to a temporary file, upload it to "
+        "OMERO, then delete it. Can't be combined with -o or --skip-upload.",
+    )
+    advanced.add_argument(
         "--max-failed",
         type=int,
         default=None,
         metavar="N",
-        help="Batch mode: exit non-zero if more than N images failed. By default "
-        "a batch exits non-zero only when *every* image failed, since one "
-        "bad slide in a few thousand shouldn't fail a scheduled run. Set "
-        "this to make the tolerance explicit (e.g. --max-failed 0 to fail "
-        "on any error at all).",
+        help="batch only: exit with an error if more than N images failed "
+        "(e.g. 0 to fail on any error). By default a batch only exits with an "
+        "error when every image failed, so one bad slide doesn't fail a "
+        "scheduled run.",
     )
-    parser.add_argument(
-        "--format",
-        choices=["jp2", "jpg", "jpeg", "png", "tif", "tiff"],
-        default="jp2",
-        help="Output format when the filename isn't fixed by an explicit -o path "
-        "(default: jp2). Also selects which format is searched for/uploaded as "
-        "an OMERO large-recon annotation.",
-    )
-    add_common_output_args(parser)
-    add_creds_args(parser)
+    add_fs_map_arg(advanced)
     parser.set_defaults(handler=run)
 
 

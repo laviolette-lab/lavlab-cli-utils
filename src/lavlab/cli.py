@@ -18,6 +18,7 @@ import logging
 import sys
 
 from lavlab.commands import geojson, lr, meta, roi_cmd, seg, tile
+from lavlab.commands._shared import HelpFormatter, add_subcommands, style_parser
 
 
 def _libvips_install_hint() -> str:
@@ -34,26 +35,46 @@ def _libvips_install_hint() -> str:
     return "Install the libvips system library for your platform and try again."
 
 
+DESCRIPTION = """\
+LAVLab command-line tools for OMERO: pull downsampled slides and ROI masks,
+cut training tiles, label ROIs, move QuPath GeoJSON in and out, and convert
+DICOM SEG <-> NIfTI."""
+
+EPILOG = """\
+Run 'lavlab COMMAND --help' to see what a command needs and the options it takes.
+
+Commands that talk to OMERO need a username, password, server and port. Pass
+them after the command with -u/-w/-s/-p, or set OMERO_USER, OMERO_PASSWORD,
+OMERO_HOST and OMERO_PORT once in your shell.
+
+The options above go *before* the command, e.g. 'lavlab --override lr 12345'."""
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="lavlab", description="LAVLab OMERO CLI utilities."
-    )
-    parser.add_argument(
-        "--override",
-        action="store_true",
-        default=False,
-        help="Write over existing output files (default: False).",
+    parser = style_parser(
+        argparse.ArgumentParser(
+            prog="lavlab",
+            usage="%(prog)s [-v] [--override] COMMAND ...",
+            description=DESCRIPTION,
+            epilog=EPILOG,
+            formatter_class=HelpFormatter,
+        )
     )
     parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
-        help="Enable DEBUG logging (very chatty -- logs a repr of every OMERO tile "
-        "response, which measurably slows a network large-recon fetch; leave "
-        "off unless you're diagnosing something).",
+        help="Show DEBUG logging. Very chatty, and slows down network fetches; "
+        "only for diagnosing problems.",
+    )
+    parser.add_argument(
+        "--override",
+        action="store_true",
+        default=False,
+        help="Replace output files that already exist (default: skip them).",
     )
 
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = add_subcommands(parser, "command")
     lr.add_parser(subparsers)
     roi_cmd.add_parser(subparsers)
     tile.add_parser(subparsers)

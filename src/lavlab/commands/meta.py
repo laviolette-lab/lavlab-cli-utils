@@ -9,7 +9,14 @@ from __future__ import annotations
 import argparse
 import logging
 
-from lavlab.commands._shared import add_creds_args, connect_from_args, group_of
+from lavlab.commands._shared import (
+    add_advanced_group,
+    add_command,
+    add_creds_args,
+    add_subcommands,
+    connect_from_args,
+    group_of,
+)
 from lavlab.palettes import load_color_mapping, match_color
 
 # omero.rtypes, lavlab.omero_client and lavlab.roi (numpy, skimage, omero)
@@ -21,43 +28,91 @@ log = logging.getLogger(__name__)
 DEFAULT_TOLERANCE = 10
 
 
+TEXTVALUE_DESCRIPTION = """\
+Label unlabelled ROI shapes by their color.
+
+Every shape with an empty comment (textValue) has its outline color compared
+against PALETTE; if one of the palette's colors is close enough, that color's
+label is written as the shape's comment. Shapes that already have a comment
+are never changed. Try --dry-run first to see what would change.
+
+PALETTE is either 'default' (the lab's standard annotation colors) or a path
+to a YAML/JSON file of entries like:
+  - rgb: [48, 255, 50]
+    text: G3
+  - hex: "#FF7A00"
+    text: HGPIN"""
+
+TEXTVALUE_EXAMPLES = """\
+Examples:
+  lavlab meta roi textvalue default 12345 12346 --dry-run
+  lavlab meta roi textvalue ./my_palette.yaml -g 3"""
+
+
 def add_parser(subparsers) -> None:
-    meta_parser = subparsers.add_parser("meta", help="Metadata utilities.")
-    meta_subparsers = meta_parser.add_subparsers(dest="meta_resource", required=True)
+    meta_parser = add_command(
+        subparsers,
+        "meta",
+        help="Edit metadata in OMERO (e.g. label ROIs by color).",
+        usage="%(prog)s COMMAND ...",
+        description="Edit metadata stored in OMERO.",
+    )
+    meta_subparsers = add_subcommands(meta_parser, "meta_resource")
 
-    roi_parser = meta_subparsers.add_parser("roi", help="ROI metadata utilities.")
-    roi_subparsers = roi_parser.add_subparsers(dest="meta_roi_action", required=True)
+    roi_parser = add_command(
+        meta_subparsers,
+        "roi",
+        help="Edit ROI metadata.",
+        usage="%(prog)s COMMAND ...",
+        description="Edit metadata on OMERO ROIs.",
+    )
+    roi_subparsers = add_subcommands(roi_parser, "meta_roi_action")
 
-    textvalue_parser = roi_subparsers.add_parser(
+    textvalue_parser = add_command(
+        roi_subparsers,
         "textvalue",
-        help="Fill blank ROI shape comments from a stroke-color palette.",
+        help="Fill in blank ROI comments by matching each shape's color to a palette.",
+        usage="%(prog)s PALETTE (IMAGE_ID ... | -g ID) [options]",
+        description=TEXTVALUE_DESCRIPTION,
+        epilog=TEXTVALUE_EXAMPLES,
     )
     textvalue_parser.add_argument(
         "text_mapping",
-        help="A built-in palette name (e.g. 'default') or a path to a YAML/JSON palette file.",
+        metavar="PALETTE",
+        help="A built-in palette name (e.g. 'default') or a YAML/JSON palette file.",
     )
     textvalue_parser.add_argument(
         "image_ids",
         nargs="*",
         type=int,
-        help="OMERO image IDs to process. Omit and use --group to process a whole group.",
+        metavar="IMAGE_ID",
+        help="OMERO image IDs to process. Leave out and use -g for a whole group.",
     )
     textvalue_parser.add_argument(
-        "-g", "--group", type=int, help="Process every image in this OMERO group."
-    )
-    textvalue_parser.add_argument(
-        "--tolerance",
+        "-g",
+        "--group",
         type=int,
-        default=DEFAULT_TOLERANCE,
-        help=f"Per-channel color match tolerance (default: {DEFAULT_TOLERANCE}).",
+        metavar="ID",
+        help="Process every image in this OMERO group.",
     )
     textvalue_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Report what would be updated (including each matched shape's ID and "
-        "label) without writing anything to OMERO.",
+        help="Show which shapes would be labelled, and with what, without "
+        "writing anything to OMERO.",
     )
+
     add_creds_args(textvalue_parser)
+
+    advanced = add_advanced_group(textvalue_parser)
+    advanced.add_argument(
+        "--tolerance",
+        type=int,
+        default=DEFAULT_TOLERANCE,
+        metavar="N",
+        help="How far each of red, green and blue (0-255) may be from a palette "
+        f"color and still count as a match (default: {DEFAULT_TOLERANCE}).",
+    )
     textvalue_parser.set_defaults(handler=run)
 
 

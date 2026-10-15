@@ -13,6 +13,9 @@ import time
 from collections import Counter
 
 from lavlab.commands._shared import (
+    BATCH_TARGET_HELP,
+    add_advanced_group,
+    add_command,
     add_creds_args,
     connect_from_args,
     group_of,
@@ -32,8 +35,22 @@ DEFAULT_EXCLUDE_TEXT = ("exclusion roi",)
 DEFAULT_JPEG_QUALITY = 90
 DEFAULT_CONNECTIONS = 4
 
+DESCRIPTION = f"""\
+Cut whole-slide images from OMERO into fixed-size image tiles, for training
+or inference.
+
+Pick one mode:
+  --roi    tiles only inside annotated ROIs, sorted into one folder per class.
+           Choose which ROIs with --all or -t. Tissue outside every ROI goes
+           to a '{DEFAULT_BACKGROUND_LABEL}' background folder.
+  --whole  every tile with tissue on it, in one 'whole/' folder (for inference
+           or unannotated slides).
+
+Tiles are written to <out>/<subject>/<slide>/, with a manifest.csv listing
+every tile. Start with --dry-run to see how many tiles you would get."""
+
 EXAMPLES = """\
-examples:
+Examples:
   # How many tiles would I get? Counts per class and per ROI, writes nothing.
   lavlab tile 12345 --roi --all --dry-run -o ./tiles
 
@@ -88,291 +105,287 @@ def _format(text: str) -> str:
 
 
 def add_parser(subparsers) -> None:
-    parser = subparsers.add_parser(
+    parser = add_command(
+        subparsers,
         "tile",
-        help="Cut whole-slide images into fixed-size tiles for training.",
-        description="Cut whole-slide images into fixed-size tiles for training "
-        "or inference. Start with --dry-run to see what a run would produce.",
+        help="Cut slides into fixed-size tiles for training or inference.",
+        usage="%(prog)s TARGET -o DIR (--roi | --whole) [options]",
+        description=DESCRIPTION,
         epilog=EXAMPLES,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "target", help="An OMERO image ID, or 'batch' to tile a whole group."
-    )
+    parser.add_argument("target", metavar="TARGET", help=BATCH_TARGET_HELP)
     parser.add_argument(
         "-o",
         "--out",
         required=True,
         metavar="DIR",
-        help="Output root directory (required).",
+        help="Folder to write tiles into (required).",
     )
-
-    what = parser.add_argument_group("what to tile")
-    mode = what.add_mutually_exclusive_group(required=True)
-    mode.add_argument(
-        "--whole",
-        action="store_true",
-        help="Tile the whole slide (tissue only), under a flat 'whole/' label. "
-        "For inference or unannotated slides -- its output is never "
-        "treated as a benign class.",
-    )
+    mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument(
         "--roi",
         action="store_true",
-        help="Tile only inside ROIs, labelling each tile by the annotation "
-        "it falls in.",
+        help="Tile only inside ROIs, labelling each tile by the annotation it "
+        "falls in. Needs --all or -t.",
     )
-    what.add_argument(
+    mode.add_argument(
+        "--whole",
+        action="store_true",
+        help="Tile every bit of tissue on the slide into one 'whole/' folder. "
+        "For inference or unannotated slides; never treated as a class.",
+    )
+    parser.add_argument(
         "-a",
         "--all",
         action="store_true",
-        help="--roi: include every annotation regardless of textValue.",
+        help="--roi: use every ROI, whatever its comment.",
     )
-    what.add_argument(
+    parser.add_argument(
         "-t",
         "--text-filter",
         type=str.lower,
         action="append",
         default=[],
-        help="--roi: whitelist a textValue or class folder name "
-        "(repeatable, case-insensitive). Mutually exclusive with --all.",
+        metavar="TEXT",
+        help="--roi: use only ROIs with this comment or class folder name "
+        "(repeatable, ignores case). Not with --all.",
     )
-    what.add_argument(
-        "--labels",
-        metavar="PATH",
-        help="Custom textValue -> class folder YAML (default: the bundled "
-        "lavlab/data/default_tile_labels.yaml).",
+    parser.add_argument(
+        "--size",
+        type=int,
+        default=DEFAULT_SIZE,
+        metavar="PX",
+        help=f"Tile width and height in pixels (default: {DEFAULT_SIZE}).",
+    )
+    parser.add_argument(
+        "-g",
+        "--group",
+        type=int,
+        metavar="ID",
+        help="batch only: just this OMERO group's images (default: every group "
+        "you belong to).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        metavar="N",
+        help="batch only: slides tiled in parallel (default: 8).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Work out every tile and print counts per class and per ROI "
+        "without writing anything. The cheap way to ask 'do I have enough "
+        "G4 cribriform?'",
     )
 
-    geometry = parser.add_argument_group("tile size and scale")
+    add_creds_args(parser)
+
+    geometry = add_advanced_group(parser, "tile scale and spacing")
     scale = geometry.add_mutually_exclusive_group()
     scale.add_argument(
         "--mpp",
         type=float,
         default=None,
-        help=f"Target micrometres per pixel (default: {DEFAULT_MPP}). Read "
-        "against the image's own pixel size to pick a pyramid level "
-        "and resize factor. Errors out if the image has no pixel "
-        "size recorded -- use --downsample instead.",
+        help=f"Microns per pixel to tile at (default: {DEFAULT_MPP}, about 20x). "
+        "Needs the image to have a pixel size recorded in OMERO; if it "
+        "doesn't, use --downsample.",
     )
     scale.add_argument(
         "--scales",
         type=_parse_scales,
         default=None,
         metavar="MPP,MPP",
-        help="Write concentric crops at several scales in one pass, e.g. "
-        "0.5,1.0: the same centre at 0.5 um/px (detail) and 1.0 um/px "
-        "(context). The finest scale decides the grid and labels. Files "
-        "are named ..._x<cx>_y<cy>_mpp<scale>.<fmt> so pairs stay matched. "
-        "Instead of --mpp.",
+        help="Save each tile at several scales around the same centre, e.g. "
+        "0.5,1.0 for detail plus context. The finest scale decides the grid "
+        "and labels; files end in _mpp<scale>. Instead of --mpp.",
     )
     scale.add_argument(
         "--downsample",
         type=float,
         default=None,
         metavar="N",
-        help="Use an explicit level-0-pixels-per-output-pixel factor "
-        "instead of --mpp. The only option for an image with no "
-        "physical pixel size.",
-    )
-    geometry.add_argument(
-        "--size",
-        type=int,
-        default=DEFAULT_SIZE,
-        help=f"Tile edge in output pixels (default: {DEFAULT_SIZE}).",
+        help="Shrink the full-resolution image by N instead of using --mpp. "
+        "The only choice for images with no recorded pixel size.",
     )
     spacing = geometry.add_mutually_exclusive_group()
     spacing.add_argument(
         "--overlap",
         type=int,
         default=0,
-        help="Overlap between neighbouring tiles in output pixels; stride "
-        "is size - overlap (default: 0).",
+        metavar="PX",
+        help="Pixels neighbouring tiles share (default: 0).",
     )
     spacing.add_argument(
         "--stride",
         type=int,
         default=None,
-        help="Distance between neighbouring tile origins in output pixels "
-        "(default: --size, i.e. no overlap). --stride 256 with --size 512 "
-        "is half-overlapping. Instead of --overlap.",
+        metavar="PX",
+        help="Pixels between neighbouring tile corners (default: --size, no "
+        "overlap). --stride 256 with --size 512 is half-overlapping. Instead "
+        "of --overlap.",
     )
 
-    filters = parser.add_argument_group("which tiles are kept")
-    filters.add_argument(
-        "--erode",
-        type=_parse_erode,
-        default=None,
-        metavar="UM",
-        help="--roi: only place tile centres inside each ROI shrunk inward by "
-        "this many micrometres, so a tile can't take a class it only half "
-        "overlaps. 'auto' (the default) is half a tile, which keeps whole "
-        "tiles inside the ROI; 0 turns it off. ROIs too small to survive "
-        "are counted in the summary.",
-    )
-    filters.add_argument(
-        "--min-coverage",
-        type=float,
-        default=DEFAULT_MIN_COVERAGE,
-        help="--roi: fraction of a tile that must lie inside one class's "
-        f"ROI area for it to take that class (default: {DEFAULT_MIN_COVERAGE}). "
-        "The highest-covering qualifying class wins.",
-    )
+    filters = add_advanced_group(parser, "which tiles are kept")
     filters.add_argument(
         "--tissue-thresh",
         "--tissue-threshold",
         dest="tissue_thresh",
         type=float,
         default=DEFAULT_TISSUE_THRESH,
-        help="Minimum tissue fraction to keep a tile, in both modes "
-        f"(default: {DEFAULT_TISSUE_THRESH}). Lower it (e.g. 0.25) if "
-        "glandular patterns with large lumens, like cribriform, are being "
-        "dropped as background.",
+        metavar="FRACTION",
+        help="Fraction of a tile that must be tissue to keep it, in both modes "
+        f"(default: {DEFAULT_TISSUE_THRESH}). Lower it (e.g. 0.25) if patterns "
+        "with large open spaces, like cribriform, are being dropped.",
+    )
+    filters.add_argument(
+        "--min-coverage",
+        type=float,
+        default=DEFAULT_MIN_COVERAGE,
+        metavar="FRACTION",
+        help="--roi: fraction of a tile that must lie inside one class's ROIs "
+        f"to take that class (default: {DEFAULT_MIN_COVERAGE}). The class "
+        "covering the most wins.",
+    )
+    filters.add_argument(
+        "--erode",
+        type=_parse_erode,
+        default=None,
+        metavar="UM",
+        help="--roi: only centre tiles at least this many microns inside an "
+        "ROI's edge, so a tile can't take a class it only half covers. 'auto' "
+        "(the default) is half a tile, keeping whole tiles inside; 0 turns it "
+        "off.",
     )
     filters.add_argument(
         "--exclude-text",
         type=str.lower,
         action="append",
         default=None,
-        help="textValue marking an exclusion region; any tile overlapping "
-        "one at all is dropped, in both modes (repeatable, default: "
+        metavar="TEXT",
+        help="Comment that marks an area to avoid; any tile touching one is "
+        "dropped, in both modes (repeatable, default: "
         f"{', '.join(DEFAULT_EXCLUDE_TEXT)}).",
+    )
+    filters.add_argument(
+        "--labels",
+        metavar="PATH",
+        help="--roi: YAML file mapping ROI comments to class folder names "
+        "(default: the bundled lavlab/data/default_tile_labels.yaml).",
     )
     filters.add_argument(
         "--background-label",
         default=None,
         metavar="NAME",
-        help="--roi: folder for tissue tiles inside no ROI on an annotated "
-        f"slide (default: {DEFAULT_BACKGROUND_LABEL}). Annotators mark "
-        "everything, so such tissue is genuinely benign -- but only on "
-        "a slide that has ROIs, so slides with none are skipped instead.",
-    )
-    filters.add_argument(
-        "--no-background",
-        action="store_true",
-        help="--roi: don't emit background tiles at all.",
+        help="--roi: folder for tissue tiles outside every ROI (default: "
+        f"{DEFAULT_BACKGROUND_LABEL}). Only on slides that have ROIs; slides "
+        "with none are skipped.",
     )
     filters.add_argument(
         "--background-margin",
         type=int,
         default=None,
         metavar="UM",
-        help="--roi: keep background tiles this many micrometres clear of "
-        f"every ROI (default: {DEFAULT_BACKGROUND_MARGIN}), so tiles "
-        "straddling an annotation edge aren't called benign.",
+        help="--roi: keep background tiles at least this many microns away "
+        f"from every ROI (default: {DEFAULT_BACKGROUND_MARGIN}), so tiles on "
+        "an annotation's edge aren't called background.",
+    )
+    filters.add_argument(
+        "--no-background",
+        action="store_true",
+        help="--roi: don't write background tiles at all.",
     )
 
-    sampling = parser.add_argument_group("how many tiles")
-    sampling.add_argument(
-        "--max-background-tiles",
-        type=int,
-        default=None,
-        metavar="N",
-        help="--roi: cap background tiles per slide, sampled at random "
-        f"(default: {DEFAULT_MAX_BACKGROUND_TILES}). Background "
-        "otherwise vastly outnumbers every graded class.",
-    )
+    sampling = add_advanced_group(parser, "how many tiles")
     sampling.add_argument(
         "--max-tiles",
         type=int,
         default=None,
         metavar="N",
-        help="Cap tiles per slide, sampled at random. Handy for a quick test run.",
+        help="At most N tiles per slide, picked at random. Handy for a quick test run.",
     )
     sampling.add_argument(
         "--max-tiles-per-label",
         type=int,
         default=None,
         metavar="N",
-        help="Cap tiles per class per slide, sampled at random.",
+        help="At most N tiles per class per slide, picked at random.",
+    )
+    sampling.add_argument(
+        "--max-background-tiles",
+        type=int,
+        default=None,
+        metavar="N",
+        help="--roi: at most N background tiles per slide, picked at random "
+        f"(default: {DEFAULT_MAX_BACKGROUND_TILES}), since background otherwise "
+        "far outnumbers every class.",
     )
     sampling.add_argument(
         "--seed",
         type=int,
         default=0,
-        help="Seed for every random sample, so a slide tiled twice with the "
-        "same settings yields the same tiles (default: 0).",
+        help="Seed for the random picks, so re-running with the same settings "
+        "gives the same tiles (default: 0).",
     )
 
-    output = parser.add_argument_group("output")
+    output = add_advanced_group(parser, "output files")
     output.add_argument(
         "--format",
         type=_format,
         choices=["png", "jpg"],
         default=None,
         help="Tile image format: png (default, lossless) or jpg/jpeg (much "
-        "smaller; standard for histology datasets). Rejected with "
-        "--coords-only, which writes no images at all.",
+        "smaller; common for histology datasets). Not with --coords-only.",
     )
     output.add_argument(
         "--quality",
         type=int,
         default=None,
-        help=f"JPEG quality 1-100 (default: {DEFAULT_JPEG_QUALITY}). Only with "
-        "--format jpg.",
+        metavar="1-100",
+        help=f"JPEG quality (default: {DEFAULT_JPEG_QUALITY}). Only with --format jpg.",
     )
     output.add_argument(
         "--manifest",
         metavar="PATH",
         default=None,
-        help="Also append every tile to this one CSV, across slides and across "
-        "runs -- point several commands at the same file to build one "
-        "dataset index. Rows already present aren't repeated. Tile paths "
-        "are relative to the CSV's folder. (Each slide always gets its own "
-        "manifest.csv as well.)",
+        help="Also add every tile to this one CSV, across slides and runs, to "
+        "build a single dataset index. Rows already in it aren't repeated; "
+        "tile paths are relative to the CSV's folder. (Each slide always gets "
+        "its own manifest.csv too.)",
     )
     output.add_argument(
         "--coords-only",
         action="store_true",
-        help="Write only the manifest and parameters, no image files. A "
-        "40x whole-mount grids to 80-100k tiles, so this is how you "
-        "survey a slide without materialising them.",
-    )
-    output.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Work out every tile and print counts per class and per ROI -- "
-        "and which ROIs --erode leaves no room in -- without writing "
-        "anything. The cheap way to ask 'do I have enough G4 cribriform?'",
+        help="Write only the manifest and settings, no tile images. A large "
+        "slide can give 80-100k tiles, so this surveys it without saving them.",
     )
 
-    running = parser.add_argument_group("running")
+    running = add_advanced_group(parser, "running")
     running.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip slides whose manifest.csv and tile_params.json show a "
-        "finished run with these same parameters, and resume an "
-        "interrupted slide from the tiles it already wrote. A slide tiled "
-        "with *different* parameters is warned about and skipped too, "
-        "unless the global --override is given (which re-tiles it).",
-    )
-    running.add_argument(
-        "--force-local",
-        action="store_true",
-        help="Read a JPEG-2000 source locally anyway. By default a bare .jp2 "
-        "falls forward to the network tier, because the bundled libvips "
-        "has no jp2k loader and every tile would decode the whole "
-        "codestream through Pillow.",
-    )
-    running.add_argument(
-        "-g", "--group", type=int, help="OMERO group ID (batch mode only)."
-    )
-    running.add_argument(
-        "--workers",
-        type=int,
-        default=8,
-        help="Slides tiled in parallel in batch mode (default: 8).",
+        help="Skip slides already finished with these same settings, and "
+        "resume half-finished ones. Slides tiled with different settings are "
+        "skipped with a warning, unless the global --override is given "
+        "(lavlab --override tile ...), which re-tiles them.",
     )
     running.add_argument(
         "--connections",
         type=int,
         default=None,
         metavar="N",
-        help="Parallel OMERO pixel connections per slide when tiles come over "
-        f"the network (default: {DEFAULT_CONNECTIONS}). Raise it if fetches "
-        "dominate and the server has headroom.",
+        help="Parallel OMERO connections per slide when tiles come over the "
+        f"network (default: {DEFAULT_CONNECTIONS}). Raise it if downloading is "
+        "the bottleneck and the server can take it.",
     )
-    add_creds_args(parser)
+    running.add_argument(
+        "--force-local",
+        action="store_true",
+        help="Read a JPEG-2000 (.jp2) original from local storage anyway. By "
+        "default these are fetched over the network instead, because reading "
+        "them locally decodes the whole file for every tile.",
+    )
     parser.set_defaults(handler=run)
 
 
