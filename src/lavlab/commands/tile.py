@@ -17,6 +17,7 @@ from lavlab.commands._shared import (
     add_advanced_group,
     add_command,
     add_creds_args,
+    add_override_arg,
     connect_from_args,
     group_of,
     parse_target,
@@ -367,8 +368,12 @@ def add_parser(subparsers) -> None:
         action="store_true",
         help="Skip slides already finished with these same settings, and "
         "resume half-finished ones. Slides tiled with different settings are "
-        "skipped with a warning, unless the global --override is given "
-        "(lavlab --override tile ...), which re-tiles them.",
+        "skipped with a warning (see --override).",
+    )
+    add_override_arg(
+        running,
+        "With --skip-existing: re-tile slides whose tiles were cut with "
+        "different settings, instead of skipping them.",
     )
     running.add_argument(
         "--connections",

@@ -15,7 +15,9 @@ import argparse
 
 import pytest
 
-from lavlab.commands.lr import _summarise_batch, _validate_args
+from lavlab.cli import build_parser
+from lavlab.commands import lr as lr_cmd
+from lavlab.commands.lr import _keep_existing, _summarise_batch, _validate_args
 
 
 def _ok(image_id, tier="local"):
@@ -161,3 +163,144 @@ def test_max_failed_rejects_negative():
 
 def test_max_failed_zero_is_accepted_in_batch_mode():
     _validate_args(_args(max_failed=0))
+
+
+# --- existing output files ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("override", "regenerate", "kept"),
+    [
+        (False, False, True),
+        (True, False, False),
+        # Regenerating and then skipping the write would do nothing at all.
+        (False, True, False),
+    ],
+)
+def test_existing_output_kept_unless_override_or_regenerate(
+    tmp_path, override, regenerate, kept
+):
+    existing = tmp_path / "LR10_slide.jp2"
+    existing.write_bytes(b"old")
+
+    args = _args(override=override, regenerate=regenerate)
+
+    assert _keep_existing(args, str(existing)) is kept
+
+
+def test_missing_output_is_never_kept(tmp_path):
+    assert not _keep_existing(_args(override=False), str(tmp_path / "absent.jp2"))
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["lr", "12345", "--regenerate", "--override"],
+        ["--override", "lr", "12345", "--regenerate"],
+    ],
+    ids=["after the command", "before the command"],
+)
+def test_override_accepted_on_either_side_of_the_command(argv):
+    assert build_parser().parse_args(argv).override is True
+
+
+@pytest.mark.parametrize("command", [["lr", "1"], ["roi", "1", "--all"]])
+def test_override_defaults_off(command):
+    assert build_parser().parse_args(command).override is False
+
+
+# --- existing output files, end to end -----------------------------------
+#
+# The bug these guard: 'lr ID --regenerate' with the output already on disk
+# skipped the image and told the user to pass an --override flag that the
+# lr subcommand didn't accept.
+
+
+class _FakeImage:
+    def __init__(self, image_id):
+        self._id = image_id
+
+    def getId(self):
+        return self._id
+
+    def getName(self):
+        return "slide.ome.tiff"
+
+
+class _FakeConn:
+    def isConnected(self):
+        return True
+
+    def getObject(self, kind, image_id):
+        return _FakeImage(image_id)
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def fake_lr(monkeypatch, tmp_path):
+    """Stand in for OMERO; record which images actually got rendered."""
+    rendered = []
+    monkeypatch.setattr(lr_cmd, "connect_from_args", lambda args: _FakeConn())
+    monkeypatch.setattr(lr_cmd, "group_of", lambda conn, image: 3)
+    monkeypatch.setattr(lr_cmd, "load_fs_map_from_args", lambda args: {})
+    monkeypatch.setattr(
+        lr_cmd,
+        "_render_and_write",
+        lambda conn, image, args, path: (
+            rendered.append((image.getId(), path)) or "network"
+        ),
+    )
+    existing = tmp_path / "LR10_slide.jp2"
+    existing.write_bytes(b"old")
+    return rendered, existing
+
+
+def _run_args(**kw):
+    return _args(**{"downsample": 10, "format": "jp2", "fs_map": None, **kw})
+
+
+@pytest.mark.parametrize(
+    ("override", "regenerate", "rebuilt"),
+    [(False, False, False), (True, False, True), (False, True, True)],
+    ids=["plain run skips", "--override replaces", "--regenerate replaces"],
+)
+def test_single_image_with_output_on_disk(
+    fake_lr, capsys, override, regenerate, rebuilt
+):
+    rendered, existing = fake_lr
+    args = _run_args(
+        target="7", output=str(existing), override=override, regenerate=regenerate
+    )
+
+    lr_cmd._run_single(args, 7)
+
+    assert rendered == ([(7, str(existing))] if rebuilt else [])
+    if not rebuilt:
+        assert "use --override to replace" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("override", "regenerate", "rebuilt"),
+    [(False, False, False), (True, False, True), (False, True, True)],
+    ids=["plain run skips", "--override replaces", "--regenerate replaces"],
+)
+def test_batch_image_with_output_on_disk(
+    fake_lr, monkeypatch, override, regenerate, rebuilt
+):
+    rendered, existing = fake_lr
+    args = _run_args(
+        output=str(existing.parent), override=override, regenerate=regenerate
+    )
+    monkeypatch.setattr(
+        lr_cmd,
+        "_WORKER_STATE",
+        {"conn": _FakeConn(), "args": args, "fs_map": {}},
+    )
+
+    result = lr_cmd._process_one(7)
+
+    assert rendered == ([(7, str(existing))] if rebuilt else [])
+    # A kept file still counts as done, but with no tier: nothing was fetched.
+    assert result == (7, str(existing), "network" if rebuilt else None)

@@ -63,7 +63,7 @@ def test_connection_flags_have_their_own_section(path):
     section = text[connection:].split(SECTION_RULE)[1]
 
     for flag in ("--user", "--password", "--host", "--port"):
-        assert re.search(rf"^\s+-\w [A-Z]+, {flag}\b", section, re.MULTILINE)
+        assert re.search(rf"^  -\w [A-Z]+, {flag}\b", section, re.MULTILINE)
         assert flag not in text[:connection]
 
 
@@ -93,7 +93,7 @@ def test_advanced_flags_are_grouped_away_from_everyday_ones():
 
     def listed(flag, section):
         # Where the flag is defined, not where another flag's help mentions it.
-        return re.search(rf"^\s+(-\w [A-Z]+, )?{flag}\b", section, re.MULTILINE)
+        return re.search(rf"^  (-\w [A-Z]+, )?{flag}\b", section, re.MULTILINE)
 
     for everyday in ("--output", "--group", "--downsample", "--format"):
         assert listed(everyday, options)
@@ -111,7 +111,19 @@ def test_advanced_flags_are_grouped_away_from_everyday_ones():
         ["geojson", "import", "a.geojson", "--image", "1", "--fill-alpha", "0"],
         ["geojson", "export", "--project", "2", "--out", "d", "--keep-bridges"],
         ["seg", "nii2dcm", "m.nii.gz", "dcm/", "-o", "o.dcm", "--label", "L"],
-        ["tile", "1", "-o", "d", "--roi", "--all", "--erode", "auto", "--seed", "3"],
+        [
+            "tile",
+            "1",
+            "-o",
+            "d",
+            "--roi",
+            "--all",
+            "--erode",
+            "auto",
+            "--seed",
+            "3",
+            "--override",
+        ],
     ],
     ids=lambda argv: " ".join(argv[:2]),
 )
@@ -128,7 +140,7 @@ def test_moving_flags_between_sections_kept_their_meaning(argv):
         if argv[1] == "import"
         else {"project": 2, "out": "d", "keep_bridges": True},
         "seg": {"segment_label": "L", "output_path": "o.dcm"},
-        "tile": {"erode": "auto", "seed": 3, "roi": True},
+        "tile": {"erode": "auto", "seed": 3, "roi": True, "override": True},
     }[argv[0]]
     for name, value in expected.items():
         assert getattr(args, name) == value
