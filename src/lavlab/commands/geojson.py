@@ -21,7 +21,10 @@ import sys
 from pathlib import Path
 
 from lavlab.commands._shared import (
+    add_advanced_group,
+    add_command,
     add_creds_args,
+    add_subcommands,
     connect_from_args,
     ensure_parent_dir,
     make_temp_path,
@@ -37,89 +40,194 @@ from lavlab.geojson.geojson_io import (
 log = logging.getLogger(__name__)
 
 
+IMPORT_DESCRIPTION = """\
+Create OMERO ROIs from QuPath GeoJSON files.
+
+Say which image each file belongs to in exactly one of three ways:
+  --image ID     one file, onto one image
+  --dataset ID   any number of files, each matched to the image in that
+                 dataset with the same name (ignoring extension and case)
+  --map CSV      a CSV of 'geojson_path,image_id' rows (no FILE arguments)"""
+
+IMPORT_EXAMPLES = """\
+Examples:
+  lavlab geojson import slide.geojson --image 12345
+  lavlab geojson import ./qupath_export/ --dataset 5 --dry-run
+  lavlab geojson import --map restore.csv"""
+
+EXPORT_DESCRIPTION = """\
+Save OMERO ROIs as QuPath-compatible GeoJSON, one file per image, named
+<image name>__omero-<image id>.geojson.
+
+Choose what to export with exactly one of --image, --dataset, --project or
+--group. Existing files are never replaced unless you pass --overwrite (or
+use --datestamp to give each run its own dated folder)."""
+
+EXPORT_EXAMPLES = """\
+Examples:
+  lavlab geojson export --image 12345 --out ./annotations/
+  lavlab geojson export --project 2 --out ./archive/ --datestamp"""
+
+
 def add_parser(subparsers) -> None:
-    geojson_parser = subparsers.add_parser(
-        "geojson", help="Move QuPath GeoJSON annotations in and out of OMERO."
+    geojson_parser = add_command(
+        subparsers,
+        "geojson",
+        help="Import/export QuPath GeoJSON annotations to/from OMERO.",
+        usage="%(prog)s COMMAND ...",
+        description="Copy annotations between QuPath GeoJSON files and OMERO ROIs.",
     )
-    geojson_subparsers = geojson_parser.add_subparsers(
-        dest="geojson_action", required=True
+    geojson_subparsers = add_subcommands(geojson_parser, "geojson_action")
+
+    importer = add_command(
+        geojson_subparsers,
+        "import",
+        help="Create OMERO ROIs from GeoJSON files.",
+        usage="%(prog)s FILE ... (--image ID | --dataset ID) [options]\n"
+        "       %(prog)s --map CSV [options]",
+        description=IMPORT_DESCRIPTION,
+        epilog=IMPORT_EXAMPLES,
+    )
+    importer.add_argument(
+        "paths",
+        nargs="*",
+        metavar="FILE",
+        help=".geojson files, or folders of them (every *.geojson and *.json "
+        "inside is used).",
+    )
+    importer.add_argument(
+        "--image", type=int, metavar="ID", help="Image to import a single file onto."
+    )
+    importer.add_argument(
+        "--dataset",
+        type=int,
+        metavar="ID",
+        help="Match each file to the image in this dataset with the same name.",
+    )
+    importer.add_argument(
+        "--map",
+        metavar="CSV",
+        help="CSV of 'geojson_path,image_id' rows saying where each file goes.",
+    )
+    importer.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Read the files and report what they contain without connecting "
+        "to OMERO or creating anything.",
     )
 
-    importer = geojson_subparsers.add_parser(
-        "import", help="create OMERO ROIs from GeoJSON files"
-    )
-    importer.add_argument("paths", nargs="*", help=".geojson files or directories")
-    target = importer.add_argument_group("which image")
-    target.add_argument("--image", type=int, help="image id, for a single file")
-    target.add_argument(
-        "--dataset", type=int, help="match files to images in this dataset by name"
-    )
-    target.add_argument("--map", help="CSV of 'geojson_path,image_id' rows")
-    style = importer.add_argument_group("appearance")
-    style.add_argument(
-        "--fill-alpha", type=int, default=90, help="0-255, or 0 for outline only"
-    )
-    style.add_argument("--stroke-width", type=float, default=2.0)
     add_creds_args(importer)
-    importer.add_argument(
-        "--dry-run", action="store_true", help="report only; never contacts OMERO"
+
+    appearance = add_advanced_group(importer, "ROI appearance")
+    appearance.add_argument(
+        "--fill-alpha",
+        type=int,
+        default=90,
+        metavar="0-255",
+        help="Fill opacity of the created ROIs; 0 draws outlines only (default: 90).",
+    )
+    appearance.add_argument(
+        "--stroke-width",
+        type=float,
+        default=2.0,
+        metavar="WIDTH",
+        help="Outline width of the created ROIs (default: 2.0).",
     )
     importer.set_defaults(handler=run_import)
 
-    exporter = geojson_subparsers.add_parser(
-        "export", help="archive OMERO ROIs as GeoJSON"
+    exporter = add_command(
+        geojson_subparsers,
+        "export",
+        help="Save OMERO ROIs as GeoJSON files.",
+        usage="%(prog)s (--image | --dataset | --project | --group) ID "
+        "--out DIR [options]",
+        description=EXPORT_DESCRIPTION,
+        epilog=EXPORT_EXAMPLES,
     )
-    source = exporter.add_argument_group("what to export")
-    source.add_argument("--image", type=int)
-    source.add_argument("--dataset", type=int)
-    source.add_argument("--project", type=int)
-    source.add_argument("--group", type=int, help="every image in this OMERO group")
-    output = exporter.add_argument_group("output")
+    exporter.add_argument(
+        "--image", type=int, metavar="ID", help="Export this one image."
+    )
+    exporter.add_argument(
+        "--dataset", type=int, metavar="ID", help="Export every image in this dataset."
+    )
+    exporter.add_argument(
+        "--project", type=int, metavar="ID", help="Export every image in this project."
+    )
+    exporter.add_argument(
+        "--group",
+        type=int,
+        metavar="ID",
+        help="Export every image in this OMERO group.",
+    )
+    exporter.add_argument(
+        "--out",
+        metavar="DIR",
+        help="Folder to write the files into (required unless --skip-local).",
+    )
+    exporter.add_argument(
+        "--datestamp",
+        action="store_true",
+        help="Write into <out>/YYYY-MM-DD/ so repeated runs don't collide.",
+    )
+    exporter.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow replacing files that already exist.",
+    )
+    exporter.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be exported without writing or uploading anything.",
+    )
+
+    add_creds_args(exporter)
+
+    output = add_advanced_group(exporter, "output")
     output.add_argument(
-        "--out", help="directory to write into (required unless --skip-local)"
+        "--skip-empty",
+        action="store_true",
+        help="Don't write a file for images that have no ROIs.",
     )
     output.add_argument(
-        "--skip-empty", action="store_true", help="no file for images with no ROIs"
+        "--compact",
+        action="store_true",
+        help="Write minified JSON (smaller files, harder to read).",
     )
-    output.add_argument("--compact", action="store_true", help="minified JSON")
     output.add_argument(
         "--ellipse-points",
         type=int,
         default=64,
-        help="vertices used to approximate an ellipse",
+        metavar="N",
+        help="GeoJSON has no ellipses, so each is saved as a polygon with N "
+        "corners (default: 64).",
     )
     output.add_argument(
         "--keep-bridges",
         action="store_true",
-        help="leave keyhole slits in place instead of restoring holes",
+        help="OMERO stores a shape with holes as one outline joined by thin "
+        "'keyhole' slits; by default these are turned back into real holes. "
+        "Pass this to keep the slits as they are.",
     )
-    output.add_argument(
-        "--datestamp",
-        action="store_true",
-        help="write into <out>/YYYY-MM-DD/ so runs do not overwrite each other",
-    )
-    output.add_argument(
-        "--overwrite", action="store_true", help="allow replacing an existing file"
-    )
-    output.add_argument(
+
+    omero_copy = add_advanced_group(exporter, "keeping a copy in OMERO")
+    omero_copy.add_argument(
         "--upload",
         action="store_true",
-        help="also attach the exported GeoJSON to the image in OMERO, under the "
-        "lavlab.geojson namespace",
+        help="Also attach each exported file to its image in OMERO (namespace "
+        "lavlab.geojson).",
     )
-    output.add_argument(
+    omero_copy.add_argument(
         "--skip-existing",
         action="store_true",
-        help="skip images that already have their GeoJSON export attached",
+        help="Skip images that already have their GeoJSON export attached in "
+        "OMERO (see --upload).",
     )
-    output.add_argument(
+    omero_copy.add_argument(
         "--skip-local",
         action="store_true",
-        help="keep no local copy -- write to a temporary file, upload it, delete it. "
-        "Requires --upload; makes --out unnecessary",
+        help="Keep no copy on disk: write to a temporary file, upload it, then "
+        "delete it. Needs --upload; --out is then not needed.",
     )
-    add_creds_args(exporter)
-    exporter.add_argument("--dry-run", action="store_true")
     exporter.set_defaults(handler=run_export)
 
 

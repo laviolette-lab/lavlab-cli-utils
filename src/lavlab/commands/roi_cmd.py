@@ -13,8 +13,12 @@ import multiprocessing
 import os
 
 from lavlab.commands._shared import (
-    add_common_output_args,
+    BATCH_TARGET_HELP,
+    add_advanced_group,
+    add_command,
     add_creds_args,
+    add_downsample_arg,
+    add_fs_map_arg,
     connect_from_args,
     ensure_parent_dir,
     group_of,
@@ -34,28 +38,40 @@ log = logging.getLogger(__name__)
 DEFAULT_SUFFIX = "_annot"
 
 
+DESCRIPTION = f"""\
+Draw an image's OMERO ROIs into a mask image, at the same scale as an
+'lavlab lr' recon so the two line up pixel for pixel.
+
+Choose which ROIs to draw with --all, or one or more -t values (matched
+against each shape's comment/textValue, ignoring case).
+
+By default the mask is RGB: a white background with each shape filled in its
+own OMERO color. With --palette it is a single-channel label mask instead:
+0 is background, the first -t value is 1, the second is 2, and so on.
+
+Files are named LR<downsample>_<image name>{DEFAULT_SUFFIX}.<format>."""
+
+EXAMPLES = """\
+Examples:
+  lavlab roi 12345 --all -o ./masks/
+  lavlab roi batch -g 3 -t G3 -t G4 -t G5 --palette --format png -o ./masks/"""
+
+
 def add_parser(subparsers) -> None:
-    parser = subparsers.add_parser("roi", help="Pull ROI mask images from OMERO.")
-    parser.add_argument(
-        "target", help="An OMERO image ID, or 'batch' to pull all images."
+    parser = add_command(
+        subparsers,
+        "roi",
+        help="Draw OMERO ROIs into mask images.",
+        usage="%(prog)s TARGET (--all | -t TEXT ...) [options]",
+        description=DESCRIPTION,
+        epilog=EXAMPLES,
     )
-    parser.add_argument(
-        "-o", "--output", help="Output file (single) or directory (batch)."
-    )
-    parser.add_argument(
-        "-g", "--group", type=int, help="OMERO group ID (batch mode only)."
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=8,
-        help="Parallel workers for batch mode (default: 8).",
-    )
+    parser.add_argument("target", metavar="TARGET", help=BATCH_TARGET_HELP)
     parser.add_argument(
         "-a",
         "--all",
         action="store_true",
-        help="Include every annotation, regardless of textValue.",
+        help="Draw every ROI, whatever its comment. Not with --palette.",
     )
     parser.add_argument(
         "-t",
@@ -63,49 +79,77 @@ def add_parser(subparsers) -> None:
         type=str.lower,
         action="append",
         default=[],
-        help="Whitelist of textValue annotations to include (repeatable).",
+        metavar="TEXT",
+        help="Draw only ROIs with this comment (repeatable, ignores case). "
+        "With --palette, the order sets each label's number.",
     )
     parser.add_argument(
-        "--suffix",
-        default=DEFAULT_SUFFIX,
-        help=f"Filename suffix (default: '{DEFAULT_SUFFIX}').",
+        "-o",
+        "--output",
+        metavar="PATH",
+        help="Where to write: a file or folder for one image, a folder for "
+        "batch. Without -o the lab's fs_map picks a folder per group (one "
+        "image falls back to the current folder; batch skips images it "
+        "can't place).",
+    )
+    parser.add_argument(
+        "-g",
+        "--group",
+        type=int,
+        metavar="ID",
+        help="batch only: just this OMERO group's images (default: every group "
+        "you belong to).",
     )
     parser.add_argument(
         "--palette",
         action="store_true",
-        help="Emit a single-channel label mask ordered by --text-filter instead of an RGB color mask.",
+        help="Write a single-channel label mask (0, 1, 2, ...) numbered in -t "
+        "order, instead of an RGB color mask.",
     )
+    add_downsample_arg(parser)
     parser.add_argument(
         "--format",
         choices=["jp2", "jpg", "jpeg", "png", "tif", "tiff"],
         default="jp2",
-        help="Output format when the filename isn't fixed by an explicit -o path "
-        "(default: jp2). Not compatible with --palette, since jpg/jpeg's lossy "
-        "compression would corrupt exact label values.",
+        help="Output image format (default: jp2). An -o file name's own "
+        "extension wins. jpg/jpeg can't be used with --palette, because lossy "
+        "compression would corrupt the label numbers.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        metavar="N",
+        help="batch only: images processed in parallel (default: 8).",
+    )
+
+    add_creds_args(parser)
+
+    advanced = add_advanced_group(parser)
+    advanced.add_argument(
+        "--suffix",
+        default=DEFAULT_SUFFIX,
+        help=f"Text added to the end of the file name (default: '{DEFAULT_SUFFIX}').",
+    )
+    advanced.add_argument(
         "--upload",
         action="store_true",
-        help="Also attach the rendered mask to the image in OMERO, under the "
-        "LargeRecon.<downsample>.roi namespace (the same one legacy batch_roi.py "
-        "used). Off by default -- roi otherwise only ever reads from OMERO.",
+        help="Also attach the finished mask to the image in OMERO (namespace "
+        "LargeRecon.<downsample>.roi). Without it, roi only reads from OMERO.",
     )
-    parser.add_argument(
+    advanced.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip any image that already has this exact mask attached in OMERO "
-        "(same downsample, suffix and format), without re-rendering it. Useful "
-        "for backfilling a whole group.",
+        help="Skip images that already have this exact mask attached in OMERO "
+        "(same --downsample, --suffix and --format; see --upload).",
     )
-    parser.add_argument(
+    advanced.add_argument(
         "--skip-local",
         action="store_true",
-        help="Don't keep a local copy -- render to a temporary file, upload it, then "
-        "delete it. Requires --upload (otherwise the mask would be rendered and "
-        "thrown away) and is incompatible with -o.",
+        help="Keep no copy on disk: write to a temporary file, upload it, then "
+        "delete it. Needs --upload; can't be combined with -o.",
     )
-    add_common_output_args(parser)
-    add_creds_args(parser)
+    add_fs_map_arg(advanced)
     parser.set_defaults(handler=run)
 
 
