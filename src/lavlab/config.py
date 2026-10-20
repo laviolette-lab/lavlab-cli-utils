@@ -17,6 +17,7 @@ import re
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
+from typing import cast
 
 import yaml
 
@@ -102,7 +103,12 @@ class FsMapGroup:
 
 
 def _default_fs_map_path() -> Path:
-    return Path(resources.files("lavlab.data").joinpath("default_fs_map.yaml"))
+    return Path(
+        cast(
+            "os.PathLike[str]",
+            resources.files("lavlab.data").joinpath("default_fs_map.yaml"),
+        )
+    )
 
 
 def load_fs_map(path: str | None) -> dict[str, FsMapGroup]:

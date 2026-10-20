@@ -47,6 +47,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import yaml
@@ -119,6 +120,11 @@ DEFAULT_JPEG_QUALITY = 90
 
 WHOLE_LABEL = "whole"
 
+MISSING_PIXEL_SIZE_MESSAGE = (
+    "image has no physical pixel size recorded, so --mpp cannot be "
+    "converted to a scale factor; pass --downsample N instead."
+)
+
 _UNKNOWN_SUBJECT = "unknown_subject"
 _SUBJECT_RE = re.compile(r"^(N\d+)(?=_)", re.IGNORECASE)
 _UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
@@ -181,7 +187,12 @@ def sanitize_label(text: str) -> str:
 
 
 def _default_label_map_path() -> Path:
-    return Path(resources.files("lavlab.data").joinpath("default_tile_labels.yaml"))
+    return Path(
+        cast(
+            "os.PathLike[str]",
+            resources.files("lavlab.data").joinpath("default_tile_labels.yaml"),
+        )
+    )
 
 
 def load_label_map(path: str | None = None) -> dict[str, list[str]]:
@@ -336,10 +347,7 @@ def resolve_total_downsample(
     if mpp is None:
         raise TilingError("one of --mpp or --downsample is required.")
     if not pixel_size_x or pixel_size_x <= 0:
-        raise MissingPixelSizeError(
-            "image has no physical pixel size recorded, so --mpp cannot be "
-            "converted to a scale factor; pass --downsample N instead."
-        )
+        raise MissingPixelSizeError(MISSING_PIXEL_SIZE_MESSAGE)
 
     sizes = [float(pixel_size_x)]
     if pixel_size_y and pixel_size_y > 0:
@@ -1576,7 +1584,7 @@ class TileParams:
         :rtype: list[float | None]
         """
         if self.scales:
-            return sorted(float(s) for s in self.scales)
+            return [*sorted(float(s) for s in self.scales)]
         return [self.mpp]
 
     def signature(self) -> dict:
@@ -1905,6 +1913,35 @@ def _local_source_errors() -> tuple:
     )
 
 
+def warn_local_fallback(
+    image_id: int, src_path: str | None, exc: BaseException
+) -> None:
+    """Log that tier 2 failed for a slide and its pixels now come from tier 3.
+
+    One message for every caller that falls forward -- ``lavlab tile`` and
+    ``lavlab.monai.OmeroWSIReader`` -- so the condition reads the same in a
+    training log as in a tiling log.
+
+    :param image_id: the OMERO image ID
+    :type image_id: int
+    :param src_path: the local source that failed
+    :type src_path: str | None
+    :param exc: what it failed with, one of :func:`_local_source_errors`
+    :type exc: BaseException
+    """
+    log.warning(
+        "Image %d: tier 2 (local source) failed for '%s' -- %s: %s. Falling "
+        "back to tier 3 (OMERO tile API), which is much slower. If this "
+        "happens for every image, the mounted repository is not readable "
+        "and should be investigated.",
+        image_id,
+        src_path,
+        type(exc).__name__,
+        exc,
+        exc_info=exc,
+    )
+
+
 def network_level_dims(conn, image) -> list[tuple[int, int]]:
     """Return ``(width, height)`` per pyramid level as OMERO reports them.
 
@@ -2162,7 +2199,7 @@ def analyze_slide(
 
 def group_rois(
     shape_ids: Iterable[int], shape_rois: dict[int, int]
-) -> dict[int | None, set[int]]:
+) -> dict[int, set[int]]:
     """Group shape ids by the OMERO ROI holding them.
 
     :param shape_ids: the shapes
@@ -2171,9 +2208,9 @@ def group_rois(
     :type shape_rois: dict[int, int]
     :return: ROI id -> its shapes; a shape of unknown ROI is its own group,
         keyed by its negated shape id so it cannot collide with a real ROI
-    :rtype: dict[int | None, set[int]]
+    :rtype: dict[int, set[int]]
     """
-    groups: dict[int | None, set[int]] = {}
+    groups: dict[int, set[int]] = {}
     for sid in shape_ids:
         key = shape_rois.get(sid, -sid)
         groups.setdefault(key, set()).add(sid)
@@ -2214,6 +2251,311 @@ def _manifest_row(
         "tissue_frac": round(record.tissue_frac, 6),
         "tier": tier,
     }
+
+
+@dataclass
+class SlideSelection:
+    """Every tile one slide yields under a set of parameters, before any read.
+
+    The output of :func:`select_tiles`, and the single source of truth for
+    *which* tiles exist: ``lavlab tile`` cuts and writes exactly these, and
+    ``lavlab.monai.build_datalist`` turns exactly these into MONAI samples.
+    Nothing in here depends on where tiles would be written.
+    """
+
+    image_id: int
+    # "ok"; "empty" (slide smaller than one tile -- nothing past the grid is
+    # filled in); or "unannotated" (--roi on a slide with no ROIs at all).
+    status: str
+    # Output tile edge in pixels, at every scale.
+    size: int
+    width0: int
+    height0: int
+    pixel_size_x: float | None
+    pixel_size_y: float | None
+    # (mpp or None for --downsample, level-0 pixels per output pixel) per
+    # output scale, finest (the labelling scale) first.
+    scale_ds: list[tuple[float | None, float]]
+    tiles: list[GridTile]
+    analysis_ds: int = 0
+    tier: str | None = None
+    src_path: str | None = None
+    level_dims: list[tuple[int, int]] = field(default_factory=list)
+    # One per entry of scale_ds.
+    plans: list[LevelPlan] = field(default_factory=list)
+    # The kept tiles at the finest scale, after every filter and cap, in
+    # row-major order.
+    records: list[TileRecord] = field(default_factory=list)
+    stats: Counter = field(default_factory=Counter)
+    available: Counter = field(default_factory=Counter)
+    label_counts: Counter = field(default_factory=Counter)
+    roi_counts: Counter = field(default_factory=Counter)
+    roi_groups: dict[int, set[int]] = field(default_factory=dict)
+    lost_rois: list[tuple[str, int | None]] = field(default_factory=list)
+    erode_um: float | None = None
+    shape_rois: dict[int, int] = field(default_factory=dict)
+
+    def records_at(self, scale_index: int) -> list[TileRecord]:
+        """Return the kept tiles as cut at one output scale.
+
+        :param scale_index: index into :attr:`scale_ds`; 0 is the finest
+        :type scale_index: int
+        :return: the records, concentric with the finest-scale ones
+        :rtype: list[TileRecord]
+        """
+        if scale_index == 0:
+            return list(self.records)
+        _mpp, ds_s = self.scale_ds[scale_index]
+        return [
+            replace(r, tile=scale_tile(r.tile, ds_s, self.size)) for r in self.records
+        ]
+
+    def output_mpp(self, scale_index: int) -> float | None:
+        """Return the micrometres per pixel of one output scale's tiles.
+
+        :param scale_index: index into :attr:`scale_ds`
+        :type scale_index: int
+        :return: the requested mpp, else the one implied by ``--downsample``
+            and the pixel size, or None when neither is known
+        :rtype: float | None
+        """
+        mpp_s, ds_s = self.scale_ds[scale_index]
+        if mpp_s is not None:
+            return mpp_s
+        return self.pixel_size_x * ds_s if self.pixel_size_x else None
+
+    def roi_id(self, record: TileRecord) -> int | None:
+        """Return the OMERO ROI id holding the shape that labelled *record*.
+
+        :param record: a kept tile
+        :type record: TileRecord
+        :return: the ROI id, or None (background tiles, unknown shapes)
+        :rtype: int | None
+        """
+        if record.shape_id is None:
+            return None
+        return self.shape_rois.get(record.shape_id)
+
+
+def select_tiles(
+    conn,
+    image,
+    params: TileParams,
+    *,
+    force_local: bool = False,
+) -> SlideSelection:
+    """Decide every tile a slide yields, reading no full-resolution pixels.
+
+    Resolves the output scales, lays the grid at the finest one, picks the
+    pixel tier (local source or OMERO tile API, falling forward with a
+    WARNING), loads the analysis thumbnail and ROIs, labels every grid cell
+    with :func:`analyze_slide`, drops concentric crops that would run off the
+    slide, and applies the seeded caps with :func:`sample_records`.
+
+    Shared by :func:`tile_slide` and ``lavlab.monai.build_datalist`` so the
+    tiles written to disk and the samples handed to a training framework
+    cannot drift apart.
+
+    :param conn: a connected gateway, already switched into the image's group
+    :param image: an OMERO ``ImageWrapper``
+    :param params: the run's settings
+    :type params: TileParams
+    :param force_local: read a JPEG-2000 source locally anyway
+    :type force_local: bool
+    :return: the selection; check :attr:`SlideSelection.status` first
+    :rtype: SlideSelection
+    :raises MissingPixelSizeError: with ``mpp`` but no recorded pixel size
+    :raises TilingError: for a slide that cannot be tiled as asked
+    """
+    image_id = int(image.getId())
+    width0 = int(image.getSizeX())
+    height0 = int(image.getSizeY())
+    pixel_x, pixel_y = image_pixel_sizes(image)
+    scale_ds: list[tuple[float | None, float]] = []
+    for mpp_s in params.output_mpps():
+        scale_ds.append(
+            (
+                mpp_s,
+                resolve_total_downsample(
+                    mpp=mpp_s,
+                    downsample=params.downsample,
+                    pixel_size_x=pixel_x,
+                    pixel_size_y=pixel_y,
+                ),
+            )
+        )
+    ds_total = scale_ds[0][1]
+    multi_scale = len(scale_ds) > 1
+
+    tiles = build_grid(width0, height0, params.size, params.overlap, ds_total)
+    selection = SlideSelection(
+        image_id=image_id,
+        status="ok",
+        size=params.size,
+        width0=width0,
+        height0=height0,
+        pixel_size_x=pixel_x,
+        pixel_size_y=pixel_y,
+        scale_ds=scale_ds,
+        tiles=tiles,
+    )
+    if not tiles:
+        log.warning(
+            "Image %d: %dx%d is smaller than a single %d px tile at this scale; "
+            "nothing to do.",
+            image_id,
+            width0,
+            height0,
+            params.size,
+        )
+        selection.status = "empty"
+        return selection
+
+    analysis_ds = analysis_downsample(tiles[0].w0)
+    tier, src_path = choose_tier(conn, image_id, force_local=force_local)
+
+    thumbnail = None
+    level_dims: list[tuple[int, int]] = []
+    if tier == "local" and src_path is not None:
+        try:
+            level_dims = local_level_dims(src_path)
+            thumbnail = _load_thumbnail_local(src_path, analysis_ds)
+        except _local_source_errors() as exc:
+            warn_local_fallback(image_id, src_path, exc)
+            tier = "network"
+            thumbnail = None
+
+    if thumbnail is None:
+        level_dims = network_level_dims(conn, image)
+        thumbnail = _load_thumbnail_network(conn, image, analysis_ds)
+
+    level_widths = [w for w, _h in level_dims]
+    plans = [select_level(level_widths, width0, ds, params.size) for _m, ds in scale_ds]
+    plan = plans[0]
+    log.info(
+        "Image %d: %d grid tiles, tier %s, pyramid level %d (x%.2f), analysis 1/%d.",
+        image_id,
+        len(tiles),
+        tier,
+        plan.index,
+        plan.downsample,
+        analysis_ds,
+    )
+    selection.analysis_ds = analysis_ds
+    selection.tier = tier
+    selection.src_path = src_path
+    selection.level_dims = level_dims
+    selection.plans = plans
+
+    from lavlab.roi import get_shapes_as_points, shape_roi_ids
+
+    shapes = (
+        get_shapes_as_points(image, img_downsample=analysis_ds, include_all=True) or []
+    )
+
+    if params.mode == "roi" and not shapes:
+        log.warning(
+            "Image %d: no ROIs at all. An unannotated slide is not a benign slide, "
+            "so it is skipped rather than tiled as background.",
+            image_id,
+        )
+        selection.status = "unannotated"
+        return selection
+
+    shape_rois = shape_roi_ids(image) if params.mode == "roi" else {}
+
+    details: dict = {}
+    records, stats, _has_rois = analyze_slide(
+        tiles,
+        thumbnail,
+        shapes,
+        analysis_ds,
+        params,
+        pixel_size_x=pixel_x,
+        details=details,
+    )
+    del thumbnail
+
+    if multi_scale:
+        # Every scale is cut around the same centre, so a centre near the
+        # slide edge can fit at the finest scale and run off at a coarser one.
+        # Drop it rather than pad: a padded context crop is not real context.
+        fitting = []
+        for record in records:
+            if all(
+                tile_fits(scale_tile(record.tile, ds, params.size), width0, height0)
+                for _m, ds in scale_ds[1:]
+            ):
+                fitting.append(record)
+            else:
+                stats["dropped_scale_edge"] += 1
+        records = fitting
+
+    available = Counter(r.label for r in records)
+    records = sample_records(
+        records,
+        max_tiles=params.max_tiles,
+        max_tiles_per_label=params.max_tiles_per_label,
+        max_background_tiles=params.max_background_tiles,
+        background_label=params.background_label,
+        seed=params.seed,
+    )
+
+    if stats.get("dropped_excluded"):
+        log.info(
+            "Image %d: %d tiles dropped by exclusion ROIs.",
+            image_id,
+            stats["dropped_excluded"],
+        )
+
+    # Report ROIs, not shapes: that is the unit annotators think in and the
+    # unit a dataset is split by.
+    selected = details["selected_shapes"]
+    lost_shapes = details["lost_shapes"]
+    roi_groups = group_rois(selected, shape_rois)
+    lost_rois = sorted(
+        (
+            (selected[next(iter(sids))], roi_id if roi_id >= 0 else None)
+            for roi_id, sids in roi_groups.items()
+            if sids and all(sid in lost_shapes for sid in sids)
+        ),
+        key=lambda item: (item[0], item[1] or 0),
+    )
+    if lost_rois:
+        log.info(
+            "Image %d: --erode (%.1f analysis px) left %d of %d ROIs with no room "
+            "for a tile centre -- they are smaller than about one tile: %s",
+            image_id,
+            details["erode_px"],
+            len(lost_rois),
+            len(roi_groups),
+            ", ".join(f"{label}:{rid}" for label, rid in lost_rois),
+        )
+
+    roi_counts: Counter = Counter()
+    for record in records:
+        if record.shape_id is not None:
+            roi_counts[(record.label, shape_rois.get(record.shape_id))] += 1
+    # List every selected ROI, including the ones that produced nothing --
+    # those are the ones worth seeing in a --dry-run.
+    for roi_key, sids in roi_groups.items():
+        label = selected[next(iter(sids))]
+        roi_counts.setdefault((label, roi_key if roi_key >= 0 else None), 0)
+
+    selection.records = records
+    selection.stats = stats
+    selection.available = available
+    selection.label_counts = Counter(r.label for r in records)
+    selection.roi_counts = roi_counts
+    selection.roi_groups = roi_groups
+    selection.lost_rois = lost_rois
+    selection.erode_um = (
+        details["erode_px"] * analysis_ds * pixel_x
+        if pixel_x
+        else (0.0 if not details["erode_px"] else None)
+    )
+    selection.shape_rois = shape_rois
+    return selection
 
 
 def tile_slide(
@@ -2297,35 +2639,8 @@ def tile_slide(
         and params_match(read_tile_params(slide_dir), params)
     )
 
-    width0 = int(image.getSizeX())
-    height0 = int(image.getSizeY())
-    pixel_x, pixel_y = image_pixel_sizes(image)
-    scale_ds: list[tuple[float | None, float]] = []
-    for mpp_s in params.output_mpps():
-        scale_ds.append(
-            (
-                mpp_s,
-                resolve_total_downsample(
-                    mpp=mpp_s,
-                    downsample=params.downsample,
-                    pixel_size_x=pixel_x,
-                    pixel_size_y=pixel_y,
-                ),
-            )
-        )
-    ds_total = scale_ds[0][1]
-    multi_scale = len(scale_ds) > 1
-
-    tiles = build_grid(width0, height0, params.size, params.overlap, ds_total)
-    if not tiles:
-        log.warning(
-            "Image %d: %dx%d is smaller than a single %d px tile at this scale; "
-            "nothing to do.",
-            image_id,
-            width0,
-            height0,
-            params.size,
-        )
+    selection = select_tiles(conn, image, params, force_local=force_local)
+    if selection.status == "empty":
         return SlideResult(
             image_id,
             "done",
@@ -2333,170 +2648,42 @@ def tile_slide(
             reason="slide smaller than one tile",
             dry_run=dry_run,
         )
-
-    analysis_ds = analysis_downsample(tiles[0].w0)
-    tier, src_path = choose_tier(conn, image_id, force_local=force_local)
-
-    thumbnail = None
-    level_dims: list[tuple[int, int]] = []
-    if tier == "local":
-        try:
-            level_dims = local_level_dims(src_path)
-            thumbnail = _load_thumbnail_local(src_path, analysis_ds)
-        except _local_source_errors() as exc:
-            log.warning(
-                "Image %d: tier 2 (local source) failed for '%s' -- %s: %s. Falling "
-                "back to tier 3 (OMERO tile API), which is much slower. If this "
-                "happens for every image, the mounted repository is not readable "
-                "and should be investigated.",
-                image_id,
-                src_path,
-                type(exc).__name__,
-                exc,
-                exc_info=True,
-            )
-            tier = "network"
-            thumbnail = None
-
-    if thumbnail is None:
-        level_dims = network_level_dims(conn, image)
-        thumbnail = _load_thumbnail_network(conn, image, analysis_ds)
-
-    level_widths = [w for w, _h in level_dims]
-    plans = [select_level(level_widths, width0, ds, params.size) for _m, ds in scale_ds]
-    plan = plans[0]
-    log.info(
-        "Image %d: %d grid tiles, tier %s, pyramid level %d (x%.2f), analysis 1/%d.",
-        image_id,
-        len(tiles),
-        tier,
-        plan.index,
-        plan.downsample,
-        analysis_ds,
-    )
-
-    from lavlab.roi import get_shapes_as_points, shape_roi_ids
-
-    shapes = (
-        get_shapes_as_points(image, img_downsample=analysis_ds, include_all=True) or []
-    )
-
-    if params.mode == "roi" and not shapes:
-        log.warning(
-            "Image %d: no ROIs at all. An unannotated slide is not a benign slide, "
-            "so it is skipped rather than tiled as background.",
-            image_id,
-        )
+    if selection.status == "unannotated":
         return SlideResult(
             image_id,
             "unannotated",
-            tier=tier,
+            tier=selection.tier,
             slide_dir=slide_dir,
             reason="no ROIs",
             dry_run=dry_run,
         )
 
-    shape_rois = shape_roi_ids(image) if params.mode == "roi" else {}
+    tier = selection.tier
+    src_path = selection.src_path
+    level_dims = selection.level_dims
+    tiles = selection.tiles
+    analysis_ds = selection.analysis_ds
+    stats = selection.stats
+    scale_ds = selection.scale_ds
+    ds_total = scale_ds[0][1]
+    multi_scale = len(scale_ds) > 1
+    plans = selection.plans
+    plan = plans[0]
+    records = selection.records
+    label_counts = selection.label_counts
+    lost_rois = selection.lost_rois
+    roi_groups = selection.roi_groups
+    erode_um = selection.erode_um
 
-    details: dict = {}
-    records, stats, _has_rois = analyze_slide(
-        tiles,
-        thumbnail,
-        shapes,
-        analysis_ds,
-        params,
-        pixel_size_x=pixel_x,
-        details=details,
-    )
-    del thumbnail
-
-    if multi_scale:
-        # Every scale is cut around the same centre, so a centre near the
-        # slide edge can fit at the finest scale and run off at a coarser one.
-        # Drop it rather than pad: a padded context crop is not real context.
-        fitting = []
-        for record in records:
-            if all(
-                tile_fits(scale_tile(record.tile, ds, params.size), width0, height0)
-                for _m, ds in scale_ds[1:]
-            ):
-                fitting.append(record)
-            else:
-                stats["dropped_scale_edge"] += 1
-        records = fitting
-
-    available = Counter(r.label for r in records)
-    records = sample_records(
-        records,
-        max_tiles=params.max_tiles,
-        max_tiles_per_label=params.max_tiles_per_label,
-        max_background_tiles=params.max_background_tiles,
-        background_label=params.background_label,
-        seed=params.seed,
-    )
-
-    if stats.get("dropped_excluded"):
-        log.info(
-            "Image %d: %d tiles dropped by exclusion ROIs.",
-            image_id,
-            stats["dropped_excluded"],
-        )
-
-    # Report ROIs, not shapes: that is the unit annotators think in and the
-    # unit a dataset is split by.
-    selected = details["selected_shapes"]
-    lost_shapes = details["lost_shapes"]
-    roi_groups = group_rois(selected, shape_rois)
-    lost_rois = sorted(
-        (
-            (selected[next(iter(sids))], roi_id if roi_id >= 0 else None)
-            for roi_id, sids in roi_groups.items()
-            if sids and all(sid in lost_shapes for sid in sids)
-        ),
-        key=lambda item: (item[0], item[1] or 0),
-    )
-    if lost_rois:
-        log.info(
-            "Image %d: --erode (%.1f analysis px) left %d of %d ROIs with no room "
-            "for a tile centre -- they are smaller than about one tile: %s",
-            image_id,
-            details["erode_px"],
-            len(lost_rois),
-            len(roi_groups),
-            ", ".join(f"{label}:{rid}" for label, rid in lost_rois),
-        )
-
-    roi_counts: Counter = Counter()
-    for record in records:
-        if record.shape_id is not None:
-            roi_counts[(record.label, shape_rois.get(record.shape_id))] += 1
-    # List every selected ROI, including the ones that produced nothing --
-    # those are the ones worth seeing in a --dry-run.
-    for roi_key, sids in roi_groups.items():
-        label = selected[next(iter(sids))]
-        roi_counts.setdefault((label, roi_key if roi_key >= 0 else None), 0)
-    label_counts = Counter(r.label for r in records)
-
-    erode_um = (
-        details["erode_px"] * analysis_ds * pixel_x
-        if pixel_x
-        else (0.0 if not details["erode_px"] else None)
-    )
-
-    def mpp_effective(mpp_s: float | None, ds_s: float) -> float | None:
-        if mpp_s is not None:
-            return mpp_s
-        return pixel_x * ds_s if pixel_x else None
-
-    common = {
+    common: dict[str, Any] = {
         "tier": tier,
         "label_counts": label_counts,
         "stats": stats,
         "slide_dir": slide_dir,
-        "roi_counts": roi_counts,
+        "roi_counts": selection.roi_counts,
         "roi_total": len(roi_groups),
         "lost_rois": lost_rois,
-        "available": available,
+        "available": selection.available,
         "erode_um": erode_um,
     }
 
@@ -2524,16 +2711,10 @@ def tile_slide(
     written = 0
     reused = 0
 
-    for scale_index, (mpp_s, ds_s) in enumerate(scale_ds):
+    for scale_index, (mpp_s, _ds_s) in enumerate(scale_ds):
         scale_plan = plans[scale_index]
-        mpp_out = mpp_effective(mpp_s, ds_s)
-        scaled = (
-            list(records)
-            if scale_index == 0
-            else [
-                replace(r, tile=scale_tile(r.tile, ds_s, params.size)) for r in records
-            ]
-        )
+        mpp_out = selection.output_mpp(scale_index)
+        scaled = selection.records_at(scale_index)
 
         def row_for(record, path, _plan=scale_plan, _mpp=mpp_out):
             return _manifest_row(
@@ -2546,9 +2727,7 @@ def tile_slide(
                 params,
                 _mpp,
                 tier,
-                shape_rois.get(record.shape_id)
-                if record.shape_id is not None
-                else None,
+                selection.roi_id(record),
             )
 
         if params.coords_only:
@@ -2559,7 +2738,7 @@ def tile_slide(
         todo: list[tuple[int, TileRecord, str]] = []
         for index, record in enumerate(scaled):
             label_dir = os.path.join(slide_dir, record.label)
-            if multi_scale:
+            if multi_scale and mpp_s is not None:
                 filename = scaled_tile_filename(
                     slide_stem, tile_center(record.tile), mpp_s, params.fmt
                 )
@@ -2575,7 +2754,8 @@ def tile_slide(
                 todo.append((index, record, tile_path))
 
         if todo:
-            if tier == "local":
+            reader: LocalRegionReader | NetworkRegionReader
+            if tier == "local" and src_path is not None:
                 reader = LocalRegionReader(
                     src_path, scale_plan, level_dims[scale_plan.index]
                 )

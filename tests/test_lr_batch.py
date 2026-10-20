@@ -227,7 +227,15 @@ class _FakeImage:
         return "slide.ome.tiff"
 
 
+class _FakeOpts:
+    def setOmeroGroup(self, group):
+        self.group = group
+
+
 class _FakeConn:
+    def __init__(self):
+        self.SERVICE_OPTS = _FakeOpts()
+
     def isConnected(self):
         return True
 

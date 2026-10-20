@@ -486,6 +486,25 @@ OMERO's session service starts refusing logins (an Ice
 `ProtocolException`), retries back off longer and at random intervals
 instead of hammering it.
 
+#### Training with MONAI
+
+To train on these tiles with [MONAI](https://monai.io), `lavlab.monai`
+provides two datasets built on the same tile selection. `LavlabTileDataset`
+reads an extraction through its `--manifest` CSV and is the one to train on.
+`OmeroPatchDataset` reads the same tiles live from OMERO, with no extraction
+step, which suits exploring but is much slower per epoch. Both split
+train/validation/test by `case_id`, never by tile.
+
+```python
+from lavlab.monai import LavlabTileDataset
+train = LavlabTileDataset("./tiles/dataset.csv", section="training", transform=...)
+```
+
+It is a Python-only optional extra and is not part of the binary:
+`pip install 'lavlab-cli-utils[monai]'`. See
+[`docs/monai.md`](docs/monai.md) for both paths, the performance tradeoff
+and worked examples.
+
 ### `lavlab meta roi textvalue` -- backfill ROI comments from stroke color
 
 ```sh

@@ -83,3 +83,19 @@ jobs:
           flags: ${{ matrix.name }}
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: laviolette-lab/lavlab-cli-utils
+
+      # lavlab.monai is an optional extra, so the run above skips its reader
+      # and dataset tests. Run them against the extra. CPU-only PyTorch on
+      # Linux: the default wheel pulls in gigabytes of CUDA libraries.
+      - name: Install the monai extra
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            pip install torch --index-url https://download.pytorch.org/whl/cpu
+          else
+            pip install torch
+          fi
+          pip install "monai>=1.5" Pillow
+
+      - name: Run the lavlab.monai tests
+        run: |
+          pytest tests/test_monai.py tests/test_monai_imports.py

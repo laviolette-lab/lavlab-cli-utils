@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help test cov lint format fix types docs serve-docs build build-mac build-linux clean install pre-commit docker-build docker-wheel
+.PHONY: help test test-monai cov lint format fix types docs serve-docs build build-mac build-linux clean install pre-commit docker-build docker-wheel
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -12,6 +12,9 @@ install: ## Install hatch and create the dev environments
 
 test: ## Run tests
 	hatch run test:test
+
+test-monai: ## Run the lavlab.monai tests (installs MONAI and PyTorch)
+	hatch run test-monai:test
 
 cov: ## Run tests with coverage report
 	hatch run test:cov

@@ -73,6 +73,23 @@ dev = [
   "pydicom",
   "pytest",
 ]
+# lavlab.monai: MONAI datasets over OMERO and `lavlab tile` output. Python-only;
+# never part of the Nuitka binary (see build_native.py). The wheel's lavlab
+# package carries no dependencies of its own, so this lists everything
+# lavlab.monai imports. omero-py also needs the Glencoe/ZeroC Ice wheel,
+# installed first (see README).
+monai = [
+  "monai>=1.5",
+  "torch",
+  "Pillow",
+  "numpy",
+  "pyvips",
+  "tifffile",
+  "imagecodecs",
+  "scikit-image",
+  "PyYAML",
+  "omero-py",
+]
 
 [project.scripts]
 lavlab = "lavlab.launcher:main"
@@ -133,6 +150,13 @@ dependencies = [
 [tool.hatch.envs.test.scripts]
 test = "pytest {args:tests}"
 cov = "pytest --cov=src --cov-report=term-missing --cov-report=xml {args:tests}"
+
+# The lavlab.monai tests, which the plain test env skips: it has no MONAI.
+[tool.hatch.envs.test-monai]
+template = "test"
+extra-dependencies = ["monai>=1.5", "torch", "Pillow"]
+[tool.hatch.envs.test-monai.scripts]
+test = "pytest {args:tests/test_monai.py tests/test_monai_imports.py}"
 
 [tool.hatch.envs.lint]
 dependencies = ["ruff>=0.4.0"]

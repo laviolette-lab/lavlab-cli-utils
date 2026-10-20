@@ -13,6 +13,7 @@ from __future__ import annotations
 import glob
 import logging
 import os
+from typing import Literal, overload
 
 from lavlab.config import ConfigError, FsMapGroup
 
@@ -79,6 +80,33 @@ def resolve_fs_map_dir(
         return os.path.join(base_dir, formatted)
 
     return None
+
+
+@overload
+def resolve_output_path(
+    output_arg: str | None,
+    fs_map: dict[str, FsMapGroup] | None,
+    group_id,
+    filename: str,
+    downsample: int,
+    suffix: str | None = ...,
+    ext: str = ...,
+    batch: Literal[False] = ...,
+) -> str: ...
+
+
+@overload
+def resolve_output_path(
+    output_arg: str | None,
+    fs_map: dict[str, FsMapGroup] | None,
+    group_id,
+    filename: str,
+    downsample: int,
+    suffix: str | None = ...,
+    ext: str = ...,
+    *,
+    batch: bool,
+) -> str | None: ...
 
 
 def resolve_output_path(

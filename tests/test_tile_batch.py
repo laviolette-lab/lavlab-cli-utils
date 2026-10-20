@@ -10,6 +10,7 @@ against a fake OMERO.
 from __future__ import annotations
 
 import multiprocessing
+import time
 from collections import Counter
 
 import pytest
@@ -56,7 +57,15 @@ class _FakeImage:
         return self._id
 
 
+class _FakeOpts:
+    def setOmeroGroup(self, group):
+        self.group = group
+
+
 class _FakeConn:
+    def __init__(self):
+        self.SERVICE_OPTS = _FakeOpts()
+
     def isConnected(self):
         return True
 
@@ -125,9 +134,19 @@ def _tile_one_failing_on(image_id_to_fail, error):
 def test_a_resource_error_fails_one_slide_and_the_batch_completes(
     fake_batch, monkeypatch, caplog
 ):
-    monkeypatch.setattr(
-        tile_cmd, "_tile_one", _tile_one_failing_on(2054, _resource_error())
-    )
+    tile_one = _tile_one_failing_on(2054, _resource_error())
+
+    def tile_once_both_workers_are_up(conn, image, args, params):
+        # The fake slides finish in microseconds: without this, one worker
+        # can tile all four before the other has run its initializer, and
+        # the pool exits with that worker's login never made -- the count
+        # below would then depend on fork timing, not on reconnect logic.
+        deadline = time.monotonic() + 10
+        while fake_batch.value < 1 + 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return tile_one(conn, image, args, params)
+
+    monkeypatch.setattr(tile_cmd, "_tile_one", tile_once_both_workers_are_up)
 
     with caplog.at_level("INFO"):
         tile_cmd._run_batch(_batch_args(workers=2))
@@ -194,6 +213,48 @@ def test_a_worker_that_cannot_log_in_at_start_does_not_hang_the_pool(
 # ---------------------------------------------------------------------------
 # the worker, in process
 # ---------------------------------------------------------------------------
+
+
+_IMAGE_GROUPS = {1: 3, 2: 5}
+
+
+class _GroupedImage(_FakeImage):
+    def __init__(self, image_id, group_id):
+        super().__init__(image_id)
+        self.details = type(
+            "Details",
+            (),
+            {"group": type("G", (), {"id": type("I", (), {"val": group_id})})},
+        )
+
+
+class _GroupScopedConn(_FakeConn):
+    """Sees an image only from its own group or the all-groups scope (-1),
+    as OMERO's query service does."""
+
+    def getObject(self, kind, image_id):
+        scope = getattr(self.SERVICE_OPTS, "group", -1)
+        group_id = _IMAGE_GROUPS[image_id]
+        if str(scope) not in ("-1", str(group_id)):
+            return None
+        return _GroupedImage(image_id, group_id)
+
+
+def test_a_worker_finds_images_in_every_group(monkeypatch):
+    """Tiling an image scopes the session to its group; the next lookup,
+    for an image in another group, must still find it."""
+    conn = _GroupScopedConn()
+    monkeypatch.setattr(
+        tile_cmd,
+        "_WORKER_STATE",
+        {"conn": conn, "args": _batch_args(), "params": None},
+    )
+    monkeypatch.setattr(tile_cmd, "_tile_one", _tile_one_failing_on(-1, None))
+
+    results = [tile_cmd._process_one(image_id) for image_id in (1, 2, 1)]
+
+    assert [r.status for r in results] == ["done", "done", "done"]
+    assert conn.SERVICE_OPTS.group == "3"  # left in the last image's group
 
 
 @pytest.fixture

@@ -22,9 +22,10 @@ import json
 import logging
 import os
 import re
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from importlib import resources
 from pathlib import Path
+from typing import cast
 
 import highdicom
 import highdicom.seg as hdseg
@@ -38,7 +39,12 @@ log = logging.getLogger(__name__)
 
 
 def _default_seg_template_path() -> Path:
-    return Path(resources.files("lavlab.data").joinpath("default_seg_template.json"))
+    return Path(
+        cast(
+            "os.PathLike[str]",
+            resources.files("lavlab.data").joinpath("default_seg_template.json"),
+        )
+    )
 
 
 def _safe_path_component(text: str) -> str:
@@ -87,7 +93,7 @@ def format_output_path(
 
 def read_nii(nii_path: str) -> SpatialImage:
     """Read a NIfTI file."""
-    return nib.load(nii_path)
+    return cast(SpatialImage, nib.load(nii_path))
 
 
 def read_seg(dicom_seg_path: str) -> highdicom.seg.Segmentation:
@@ -107,7 +113,7 @@ def get_affine_from_nifti(image: SpatialImage) -> np.ndarray:
 
 
 def _get_dicom_seg_affine(
-    seg_data: pydicom.Dataset, source_uids: list[str] | None = None
+    seg_data: pydicom.Dataset, source_uids: Sequence[str] | None = None
 ) -> np.ndarray | None:
     """Read DICOM SEG geometry in the source-stack voxel order."""
     per_frame = getattr(seg_data, "PerFrameFunctionalGroupsSequence", [])
@@ -133,8 +139,11 @@ def _get_dicom_seg_affine(
     row_direction, column_direction = iop[:3], iop[3:]
     slice_direction = np.cross(row_direction, column_direction)
     slice_spacing = float(
-        getattr(measures, "SpacingBetweenSlices", None)
-        or getattr(measures, "SliceThickness", 1.0)
+        cast(
+            "float",
+            getattr(measures, "SpacingBetweenSlices", None)
+            or getattr(measures, "SliceThickness", 1.0),
+        )
     )
     slice_step = slice_direction * slice_spacing
     first_position = None
@@ -326,7 +335,12 @@ def dcmseg_to_nifti(dicom_seg_path: str, nii_path: str, output_dir: str) -> list
         channel_output_path = format_output_path(
             output_dir, nii_basename, nii_code, segment_number
         )
-        write_nifti(nii_data, output_affine, channel_output_path, nii.header)
+        write_nifti(
+            nii_data,
+            output_affine,
+            channel_output_path,
+            cast(nib.Nifti1Header, nii.header),
+        )
         out_paths.append(channel_output_path)
 
     return out_paths
@@ -387,7 +401,9 @@ def _read_series_in_slice_order(
     :return: the datasets, in slice order
     :rtype: list[pydicom.Dataset]
     """
-    datasets = [pydicom.dcmread(str(p)) for p in dicom_series_paths]
+    datasets: list[pydicom.Dataset] = [
+        pydicom.dcmread(str(p)) for p in dicom_series_paths
+    ]
 
     if all("ImagePositionPatient" in ds for ds in datasets):
         datasets.sort(key=lambda ds: float(ds.ImagePositionPatient[2]))

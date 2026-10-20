@@ -287,29 +287,33 @@ def get_shapes_as_points(
                 if text_label is None or text_label not in text_filter:
                     continue
 
-            points = None
+            points: list[tuple[float, float]] | None = None
 
             if type(shape) is RectangleI:
                 x = float(shape.getX().getValue()) / img_downsample
                 y = float(shape.getY().getValue()) / img_downsample
                 w = float(shape.getWidth().getValue()) / img_downsample
                 h = float(shape.getHeight().getValue()) / img_downsample
-                points = _rectangle_perimeter((y, x), (y + h, x + w), shape=yx_shape)
-                points = [(points[1][i], points[0][i]) for i in range(len(points[0]))]
+                perimeter = _rectangle_perimeter((y, x), (y + h, x + w), shape=yx_shape)
+                points = [
+                    (perimeter[1][i], perimeter[0][i]) for i in range(len(perimeter[0]))
+                ]
                 # A dense pixel-by-pixel perimeter trace -- thinning it is harmless.
                 points = points[::point_downsample]
 
             elif type(shape) is EllipseI:
                 # draw.ellipse_perimeter's Cython implementation requires
                 # ints, not floats -- passing floats raises TypeError.
-                points = draw.ellipse_perimeter(
+                perimeter = draw.ellipse_perimeter(
                     round(shape._y._val / img_downsample),
                     round(shape._x._val / img_downsample),
                     round(shape._radiusY._val / img_downsample),
                     round(shape._radiusX._val / img_downsample),
                     shape=yx_shape,
                 )
-                points = [(points[1][i], points[0][i]) for i in range(len(points[0]))]
+                points = [
+                    (perimeter[1][i], perimeter[0][i]) for i in range(len(perimeter[0]))
+                ]
                 # Same as Rectangle: a dense perimeter trace, safe to thin.
                 points = points[::point_downsample]
 

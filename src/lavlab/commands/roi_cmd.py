@@ -22,6 +22,7 @@ from lavlab.commands._shared import (
     add_override_arg,
     connect_from_args,
     ensure_parent_dir,
+    get_image,
     group_of,
     load_fs_map_from_args,
     make_temp_path,
@@ -196,10 +197,10 @@ def _validate_selection(args: argparse.Namespace) -> None:
 def run(args: argparse.Namespace) -> None:
     _validate_selection(args)
     target = parse_target(args.target)
-    if target == "batch":
-        _run_batch(args)
-    else:
+    if isinstance(target, int):
         _run_single(args, target)
+    else:
+        _run_batch(args)
 
 
 def _render_and_write(
@@ -341,7 +342,7 @@ def _process_one(image_id: int):
                 conn = connect_from_args(args)
                 _WORKER_STATE["conn"] = conn
 
-            image = conn.getObject("Image", image_id)
+            image = get_image(conn, image_id)
             if image is None:
                 log.warning("Image %d not found, skipping.", image_id)
                 return None
@@ -361,6 +362,7 @@ def _process_one(image_id: int):
             group_id = group_of(conn, image)
             name = image.getName()
 
+            output_path: str | None
             if args.skip_local:
                 output_path = make_temp_path(args.format)
             else:
