@@ -19,6 +19,7 @@ import argparse
 import logging
 import math
 import os
+import re
 from collections.abc import Iterable, Sequence
 
 from lavlab.commands.tile import DEFAULT_BACKGROUND_LABEL
@@ -259,9 +260,45 @@ def tile_params(
     try:
         tile_cmd._validate_args(args)
     except SystemExit as exc:
-        message = str(exc.code)
-        raise ValueError(message.removeprefix("error: ")) from None
+        message = str(exc.code).removeprefix("error: ")
+        raise ValueError(_python_names(message)) from None
     return tile_cmd._build_params(args)
+
+
+#: How :func:`tile_params` spells each ``lavlab tile`` flag its errors can
+#: name. The errors come from the CLI's own validation, so they name flags;
+#: a Python caller passed keyword arguments.
+_PYTHON_NAMES = {
+    "--roi": "tile selection",
+    "--all": "all_labels=True",
+    "--text-filter": "labels=[...]",
+    "--size": "size",
+    "--mpp": "mpp",
+    "--scales": "scales",
+    "--downsample": "downsample",
+    "--overlap": "overlap",
+    "--erode": "erode",
+    "--min-coverage": "min_coverage",
+    "--tissue-thresh": "tissue_threshold",
+    "--exclude-text": "exclude_text",
+    "--labels": "labels_yaml",
+    "--background-label": "background_label",
+    "--no-background": "background_label=None",
+    "--background-margin": "background_margin",
+    "--max-tiles": "max_tiles",
+    "--max-tiles-per-label": "max_tiles_per_label",
+    "--max-background-tiles": "max_background_tiles",
+    "--seed": "seed",
+}
+
+
+def _python_names(message: str) -> str:
+    """Rewrite the ``lavlab tile`` flags in *message* as :func:`tile_params` arguments."""
+    return re.sub(
+        r"--[a-z][a-z-]*",
+        lambda m: _PYTHON_NAMES.get(m.group(0), m.group(0)),
+        message,
+    )
 
 
 def default_classes(params: TileParams) -> list[str] | None:
@@ -398,10 +435,25 @@ def selection_samples(
 
 
 def _connect(creds):
-    from lavlab.config import resolve_creds
+    """Open a gateway from *creds*, or from the ``OMERO_*`` environment variables.
+
+    :raises lavlab.config.ConfigError: if a credential is in neither, worded
+        for a Python caller rather than the CLI's command line
+    """
+    from lavlab.config import ConfigError, resolve_creds
     from lavlab.omero_client import connect
 
-    return connect(creds if creds is not None else resolve_creds())
+    if creds is None:
+        try:
+            creds = resolve_creds()
+        except ConfigError as exc:
+            raise ConfigError(
+                str(exc).replace(
+                    "pass it on the command line",
+                    "pass creds=lavlab.config.OmeroCreds(user, password, host, port)",
+                )
+            ) from None
+    return connect(creds)
 
 
 def build_datalist(

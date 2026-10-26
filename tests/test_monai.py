@@ -21,6 +21,7 @@ import functools
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 
@@ -42,6 +43,7 @@ tifffile = pytest.importorskip("tifffile")
 import lavlab.omero_client as omero_client  # noqa: E402
 import lavlab.roi as roi_module  # noqa: E402
 from lavlab import tiling  # noqa: E402
+from lavlab.config import ConfigError  # noqa: E402
 from lavlab.monai import datalist as datalist_module  # noqa: E402
 from lavlab.monai.datalist import (  # noqa: E402
     build_datalist,
@@ -49,10 +51,6 @@ from lavlab.monai.datalist import (  # noqa: E402
     parse_image_id,
     tile_params,
 )
-
-# ---------------------------------------------------------------------------
-# a fake OMERO in front of a real pyramid
-# ---------------------------------------------------------------------------
 
 LEVELS = 3
 PIXEL_SIZE = 0.5
@@ -272,7 +270,6 @@ def _install_world(directory, setattr):
             self._cache[(tx, ty)] = level[y : y + tile_h, x : x + tile_w].copy()
 
     setattr(tiling.NetworkRegionReader, "_gather", gather)
-    # A partial of a module-level class: picklable, as a spawned worker needs.
     world.conn = functools.partial(_FakeConn, world.images)
     return world
 
@@ -299,11 +296,6 @@ def _key(item):
     return (item["omero_image_id"], item["x0"], item["y0"])
 
 
-# ---------------------------------------------------------------------------
-# image names
-# ---------------------------------------------------------------------------
-
-
 def test_image_names_round_trip():
     assert image_uri(1962) == "omero://1962"
     assert parse_image_id("omero://1962") == 1962
@@ -311,11 +303,6 @@ def test_image_names_round_trip():
     for bad in ("1962", "/data/slide.svs", "omero://abc", True, 1.5):
         with pytest.raises(ValueError):
             parse_image_id(bad)
-
-
-# ---------------------------------------------------------------------------
-# tile_params mirrors the CLI
-# ---------------------------------------------------------------------------
 
 
 def _cli_params(*flags):
@@ -387,17 +374,43 @@ def test_tile_params_matches_the_cli(kwargs, flags):
 def test_tile_params_rejects_what_the_cli_rejects():
     with pytest.raises(ValueError, match="contradictory"):
         tile_params(labels=["G3"], all_labels=True)
-    with pytest.raises(ValueError, match="--all or at least one"):
+    with pytest.raises(ValueError, match="all_labels=True or at least one"):
         tile_params()
     with pytest.raises(ValueError, match="at most one"):
         tile_params(all_labels=True, mpp=0.5, downsample=2)
-    with pytest.raises(ValueError, match="--min-coverage"):
+    with pytest.raises(ValueError, match="min_coverage is a fraction"):
         tile_params(all_labels=True, min_coverage=2)
 
 
-# ---------------------------------------------------------------------------
-# parity: build_datalist == lavlab tile
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"labels": ["G3"], "all_labels": True},
+        {"all_labels": True, "min_coverage": 2},
+        {"all_labels": True, "size": 0},
+    ],
+)
+def test_tile_params_errors_name_python_arguments_not_cli_flags(kwargs):
+    """The CLI's validation runs underneath, but the caller passed kwargs."""
+    with pytest.raises(ValueError) as excinfo:
+        tile_params(**kwargs)
+
+    # "--" alone is a dash in these messages; "--word" would be a CLI flag.
+    assert not re.search(r"--[a-z]", str(excinfo.value))
+
+
+def test_missing_credentials_point_at_creds_not_the_command_line(monkeypatch):
+    for name in ("OMERO_USER", "OMERO_PASSWORD", "OMERO_HOST", "OMERO_PORT"):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(ConfigError) as excinfo:
+        datalist_module._connect(None)
+
+    message = str(excinfo.value)
+    assert "creds=" in message
+    assert "OMERO_USER" in message
+    assert "command line" not in message
 
 
 def _cli_flags(**settings):
@@ -566,11 +579,6 @@ def test_datalist_skips_unannotated_slides_and_can_skip_failures(
     assert (
         build_datalist(5, conn=omero_world.conn(), skip_failed=True, **SETTINGS) == []
     )
-
-
-# ---------------------------------------------------------------------------
-# OmeroWSIReader
-# ---------------------------------------------------------------------------
 
 try:
     import monai
@@ -782,11 +790,6 @@ def test_reader_reconnects_after_losing_its_session(omero_world):
     second = reader.connection()
 
     assert second is not first and not second.closed
-
-
-# ---------------------------------------------------------------------------
-# datasets: one extraction, read both ways
-# ---------------------------------------------------------------------------
 
 
 def _extract(world, out, manifest, **settings):

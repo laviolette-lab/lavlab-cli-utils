@@ -29,7 +29,7 @@ import threading
 import numpy as np
 
 from lavlab.monai._optional import EXTRA_HINT, is_missing_extra
-from lavlab.monai.datalist import claim_vips, image_uri, parse_image_id
+from lavlab.monai.datalist import _connect, claim_vips, image_uri, parse_image_id
 from lavlab.tiling import (
     MISSING_PIXEL_SIZE_MESSAGE,
     LevelPlan,
@@ -67,13 +67,6 @@ def _reset_process_lock() -> None:
 
 
 os.register_at_fork(after_in_child=_reset_process_lock)
-
-
-def _connect(creds):
-    from lavlab.config import resolve_creds
-    from lavlab.omero_client import connect
-
-    return connect(creds if creds is not None else resolve_creds())
 
 
 def _close_owned(conn, owner_pid: int) -> None:
