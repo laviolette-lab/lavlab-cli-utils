@@ -580,6 +580,7 @@ def test_datalist_skips_unannotated_slides_and_can_skip_failures(
         build_datalist(5, conn=omero_world.conn(), skip_failed=True, **SETTINGS) == []
     )
 
+
 try:
     import monai
     import torch
