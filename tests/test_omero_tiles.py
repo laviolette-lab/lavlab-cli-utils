@@ -182,3 +182,87 @@ def test_merge_async_iters_propagates_producer_exceptions():
             await asyncio.wait_for(_collect(merge_async_iters(*producers)), timeout=2.0)
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# generate_over_network from inside a running event loop (a Jupyter kernel)
+# ---------------------------------------------------------------------------
+
+
+class _Value:
+    def __init__(self, value):
+        self._value = value
+
+    def getValue(self):
+        return self._value
+
+
+class _FakePixels:
+    def getPixelsType(self):
+        return _Value("uint8")
+
+    def getId(self):
+        return 99
+
+
+class _FakeRgbImage(_FakeImage):
+    def __init__(self):
+        super().__init__(1000, 1000)
+
+    def getId(self):
+        return 1
+
+    def getSizeC(self):
+        return 3
+
+    def getSizeZ(self):
+        return 1
+
+    def getSizeT(self):
+        return 1
+
+    def getPrimaryPixels(self):
+        return _FakePixels()
+
+
+class _FakeStore(_FakeRps):
+    def setPixelsId(self, pixels_id, bypass):
+        pass
+
+    def close(self):
+        pass
+
+
+class _FakeGateway:
+    def createRawPixelsStore(self):
+        return _FakeStore()
+
+
+def test_generate_over_network_works_inside_a_running_event_loop(monkeypatch):
+    """The notebook bug: building a datalist on a workstation reads each
+    slide's thumbnail over the network, and a Jupyter kernel's main thread
+    already runs an event loop, where asyncio.run() refuses to start."""
+    import threading
+
+    import lavlab.omero_tiles as omero_tiles
+
+    gathered_on = []
+
+    async def fake_gather(conn, pixels_id, tiles, level, arr, store_count):
+        gathered_on.append(threading.current_thread().name)
+        arr[:] = 7
+
+    monkeypatch.setattr(omero_tiles, "_gather_tiles", fake_gather)
+    monkeypatch.setattr(
+        omero_tiles, "_switch_group_before_stateful_service", lambda conn, image: None
+    )
+
+    async def kernel_cell():
+        # Synchronous lavlab code, called from inside a running loop.
+        return omero_tiles.generate_over_network(_FakeGateway(), _FakeRgbImage(), 10)
+
+    img = asyncio.run(kernel_cell())
+
+    assert (img.width, img.height, img.bands) == (100, 100, 3)
+    assert img.avg() == 7
+    assert gathered_on and gathered_on[0] != threading.current_thread().name

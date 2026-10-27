@@ -11,10 +11,11 @@ regression check that the module imports with zero Ice/omero dependency.
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 
-from lavlab.omero_asyncio import AsyncService, AsyncSession
+from lavlab.omero_asyncio import AsyncService, AsyncSession, run_sync
 
 
 class _FakeAsyncResult:
@@ -105,3 +106,55 @@ def test_async_session_wraps_get_service_results_too():
         assert result == 30
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# run_sync: synchronous callers, with or without an event loop already running
+# ---------------------------------------------------------------------------
+
+
+async def _thread_and_sum(a, b):
+    await asyncio.sleep(0)
+    return threading.current_thread().name, a + b
+
+
+def test_run_sync_without_a_running_loop_is_asyncio_run():
+    thread, total = run_sync(_thread_and_sum(2, 3))
+
+    assert total == 5
+    assert thread == threading.current_thread().name
+
+
+def test_run_sync_works_inside_a_running_loop():
+    """A Jupyter kernel's main thread always runs an event loop, where
+    asyncio.run() refuses to start; lavlab's network reads must still work."""
+
+    async def kernel_cell():
+        # Synchronous lavlab code, called from inside a running loop.
+        return run_sync(_thread_and_sum(2, 3))
+
+    thread, total = asyncio.run(kernel_cell())
+
+    assert total == 5
+    assert thread != threading.current_thread().name  # its own loop and thread
+
+
+def test_run_sync_inside_a_running_loop_drives_ice_style_services():
+    async def fetch():
+        return await AsyncService(_FakeService()).add(2, 3)
+
+    async def kernel_cell():
+        return run_sync(fetch())
+
+    assert asyncio.run(kernel_cell()) == 5
+
+
+def test_run_sync_propagates_exceptions_inside_a_running_loop():
+    async def fail():
+        raise ValueError("boom")
+
+    async def kernel_cell():
+        return run_sync(fail())
+
+    with pytest.raises(ValueError, match="boom"):
+        asyncio.run(kernel_cell())

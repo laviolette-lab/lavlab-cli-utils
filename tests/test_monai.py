@@ -698,6 +698,29 @@ def test_both_tiers_read_identical_patches(omero_world):
 
 
 @needs_monai
+def test_network_reads_work_inside_a_running_event_loop(omero_world):
+    """In a Jupyter notebook every read happens in a thread that already runs
+    an event loop, where the network tier's asyncio.run() used to refuse."""
+    import asyncio
+
+    local = _reader(omero_world, resize_to=32)
+    expected, _meta = local.get_data(
+        local.read("omero://1962"), location=(96, 96), size=(48, 48), level=1
+    )
+    omero_world.sources[1962] = "/OMERO/ManagedRepository/not/mounted/here.ome.tiff"
+    network = _reader(omero_world, resize_to=32)
+
+    async def notebook_cell():
+        wsi = network.read("omero://1962")
+        return network.get_data(wsi, location=(96, 96), size=(48, 48), level=1)
+
+    patch, meta = asyncio.run(notebook_cell())
+
+    assert meta["tier"] == "network"
+    assert np.array_equal(patch, expected)
+
+
+@needs_monai
 def test_reader_falls_forward_when_the_source_cannot_be_opened(
     omero_world, tmp_path, caplog
 ):

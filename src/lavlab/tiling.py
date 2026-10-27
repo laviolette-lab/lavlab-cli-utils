@@ -1248,7 +1248,7 @@ class NetworkRegionReader:
         :param regions: level-0 ``(x, y, w, h)`` regions about to be read
         :type regions: Sequence[tuple[int, int, int, int]]
         """
-        import asyncio
+        from lavlab.omero_asyncio import run_sync
 
         level_regions = [
             (
@@ -1263,7 +1263,7 @@ class NetworkRegionReader:
         self._cache = {}
         if not keys:
             return
-        asyncio.run(self._gather(keys))
+        run_sync(self._gather(keys))
 
     async def _gather(self, keys: Sequence[tuple[int, int]]) -> None:
         from lavlab.omero_asyncio import AsyncSession
@@ -1350,9 +1350,9 @@ class NetworkRegionReader:
         ]
         if missing:
             # A read outside the last prefetched band -- correct, just slower.
-            import asyncio
+            from lavlab.omero_asyncio import run_sync
 
-            asyncio.run(self._gather(missing))
+            run_sync(self._gather(missing))
 
         tile_w, tile_h = self._tile_size
         out = np.zeros((height, width, len(self._channels)), dtype=np.uint8)

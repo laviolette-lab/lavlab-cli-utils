@@ -13,7 +13,7 @@ from math import ceil
 import numpy as np
 import pyvips as pv
 
-from lavlab.omero_asyncio import AsyncSession
+from lavlab.omero_asyncio import AsyncSession, run_sync
 
 log = logging.getLogger(__name__)
 
@@ -265,18 +265,12 @@ def generate_over_network(
 ) -> pv.Image:
     """Build a downsampled recon of *image* purely over the OMERO tile API.
 
-    :raises LargeReconError: if *image* isn't uint8, or generation is
-        attempted from within an already-running event loop.
-    """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        pass
-    else:
-        raise LargeReconError(
-            "generate_over_network() cannot be called from within a running event loop."
-        )
+    Callable from synchronous code anywhere, including a thread that already
+    runs an event loop, such as a Jupyter kernel's (see
+    :func:`lavlab.omero_asyncio.run_sync`).
 
+    :raises LargeReconError: if *image* isn't uint8.
+    """
     pixels = image.getPrimaryPixels()
     pixel_type = pixels.getPixelsType().getValue()
     if pixel_type != "uint8":
@@ -317,7 +311,7 @@ def generate_over_network(
 
     arr = np.zeros((level_h, level_w, len(channels)), dtype=np.uint8)
 
-    asyncio.run(_gather_tiles(conn, pixels_id, tiles, level, arr, store_count))
+    run_sync(_gather_tiles(conn, pixels_id, tiles, level, arr, store_count))
 
     if arr.shape[2] == 1:
         arr = arr[:, :, 0]
