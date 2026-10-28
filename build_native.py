@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import platform
 import shutil
@@ -63,6 +64,42 @@ SKIMAGE_NUITKA_FLAGS = [
 ]
 
 
+# scipy's vendored array_api_compat loads its numpy namespace's submodules
+# with a computed import -- __import__(__package__ + ".fft") -- which Nuitka
+# cannot follow, so `fft` was simply absent from the build and the binary
+# failed at runtime with "No module named
+# 'scipy._external.array_api_compat.numpy.fft'", reached through
+# skimage.morphology -> scipy.ndimage (lavlab/tiling.py's tissue mask). The
+# package moved between scipy releases (scipy._lib.array_api_compat up to
+# 1.17, scipy._external.array_api_compat from 1.18), so the flags name
+# wherever the installed scipy keeps it. The cupy/torch/dask namespaces do
+# the same, but only load when those array libraries are passed in, and none
+# of them is in the binary.
+SCIPY_ARRAY_API_COMPAT = (
+    "scipy._external.array_api_compat.numpy",
+    "scipy._lib.array_api_compat.numpy",
+)
+SCIPY_COMPUTED_SUBMODULES = ("fft", "linalg")
+
+
+def scipy_nuitka_flags() -> list[str]:
+    """Name scipy's computed-import submodules for the installed scipy."""
+    for package in SCIPY_ARRAY_API_COMPAT:
+        try:
+            spec = importlib.util.find_spec(package)
+        except ModuleNotFoundError:
+            continue
+        if spec is not None:
+            return [
+                f"--include-module={package}.{name}"
+                for name in SCIPY_COMPUTED_SUBMODULES
+            ]
+    return []
+
+
+NOT_IN_BINARY = ["lavlab.monai", "monai", "torch"]
+
+
 def native_target() -> str:
     """Validate that this host can build one of the two supported targets."""
     machine = platform.machine().lower()
@@ -105,7 +142,7 @@ def normalize_binary_name(output_dir: Path) -> Path:
 
 def omero_ice_modules() -> list[str]:
     """Find generated OMERO Ice modules that IceImport loads dynamically."""
-    modules = set()
+    modules: set[str] = set()
     for search_path in map(Path, sys.path):
         if not search_path.is_dir():
             continue
@@ -158,11 +195,18 @@ def build_onefile(project_dir: Path, output_dir: Path) -> Path:
         "--nofollow-import-to=tkinter",
         "--nofollow-import-to=matplotlib",
         "--nofollow-import-to=IPython",
+        # lavlab.monai is a Python-only extra (pip install
+        # 'lavlab-cli-utils[monai]'); nothing the CLI runs imports it. Keep it,
+        # and MONAI/PyTorch with it, out of the binary even when they are
+        # installed in the build environment -- they would add gigabytes and
+        # more lazily-imported submodules for Nuitka to miss.
+        *[f"--nofollow-import-to={name}" for name in NOT_IN_BINARY],
         "--lto=yes",
         f"--jobs={jobs}",
         *PYDICOM_NUITKA_FLAGS,
         *IMAGECODECS_NUITKA_FLAGS,
         *SKIMAGE_NUITKA_FLAGS,
+        *scipy_nuitka_flags(),
         *[f"--include-module={name}" for name in omero_ice_modules()],
         str(project_dir / "src" / "lavlab" / "__main__.py"),
     ]

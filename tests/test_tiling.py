@@ -2224,3 +2224,92 @@ def test_the_applied_erosion_is_reported_in_micrometres(mocked_slide, tmp_path):
     assert off.erode_um == 0.0
     saved = read_tile_params(done.slide_dir)
     assert saved["erode_um_effective"] == 4.0
+
+
+# --- tile selection is pinned ----------------------------------------------
+
+
+@needs_omero
+def test_tile_selection_is_pinned_for_a_fixed_slide_and_seed(mocked_slide, tmp_path):
+    """Exactly which tiles a fixed slide, settings and seed give, recorded once.
+
+    ``lavlab tile`` and ``lavlab.monai.build_datalist`` share
+    :func:`lavlab.tiling.select_tiles`; this pins its answer so a refactor of
+    the selection cannot quietly change an extracted dataset. Covers the
+    exclusion rule (cell (24, 24)), a per-label cap that has to sample (9 G3
+    cells, 8 after the exclusion, capped at 6) and seeded background sampling.
+    """
+    mocked_slide.value = [
+        _shape(7, _square_ring(16, 16, 40, 40), "g3"),
+        _shape(8, _square_ring(40, 48, 64, 64), "g5"),
+        _shape(9, _square_ring(24, 24, 30, 30), "exclusion roi"),
+    ]
+    out = tmp_path / "out"
+    params = _analysis_params(
+        coords_only=True,
+        max_background_tiles=5,
+        max_tiles_per_label=6,
+        seed=7,
+        background_margin_um=2.0,
+        erode_um=0.0,
+    )
+
+    tiling.tile_slide(None, _FakeImage(), params, str(out))
+
+    rows = tiling.read_manifest(str(out / "N101" / "N101_S08_HE"))
+    assert [(r["label"], int(r["x0"]), int(r["y0"]), r["roi_id"]) for r in rows] == [
+        ("benign", 56, 8, ""),
+        ("G3", 16, 16, "70"),
+        ("G3", 24, 16, "70"),
+        ("G3", 32, 16, "70"),
+        ("benign", 48, 16, ""),
+        ("G3", 16, 24, "70"),
+        ("G3", 32, 24, "70"),
+        ("G3", 16, 32, "70"),
+        ("benign", 64, 32, ""),
+        ("G5", 40, 48, "80"),
+        ("G5", 48, 48, "80"),
+        ("G5", 56, 48, "80"),
+        ("benign", 16, 56, ""),
+        ("G5", 40, 56, "80"),
+        ("G5", 48, 56, "80"),
+        ("G5", 56, 56, "80"),
+        ("benign", 8, 64, ""),
+    ]
+
+
+# --- the binary bundles what the tissue mask reaches at runtime ------------
+
+
+def test_scipy_computed_imports_are_named_for_nuitka():
+    """skimage.morphology -> scipy.ndimage reaches scipy's array_api_compat
+    numpy namespace, which loads its submodules with a computed
+    ``__import__(__package__ + ".fft")`` that Nuitka cannot follow. Each must
+    be named for the build, or the compiled binary fails at runtime with
+    "No module named 'scipy._external.array_api_compat.numpy.fft'".
+    """
+    import importlib
+    import importlib.util
+    import re
+
+    from build_native import scipy_nuitka_flags
+
+    flagged = {
+        flag.split("=", 1)[1]
+        for flag in scipy_nuitka_flags()
+        if flag.startswith("--include-module=")
+    }
+    assert flagged, "found no scipy array_api_compat package to flag"
+    package = next(iter(flagged)).rsplit(".", 1)[0]
+    source = open(importlib.util.find_spec(package).origin).read()
+    computed = {
+        f"{package}{suffix}"
+        for suffix in re.findall(
+            r"__import__\(__package__ \+ ['\"](\.\w+)['\"]\)", source
+        )
+    }
+
+    assert computed, "expected computed submodule imports to check"
+    assert computed <= flagged, f"not named for Nuitka: {sorted(computed - flagged)}"
+    for module in flagged:
+        importlib.import_module(module)

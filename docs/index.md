@@ -16,6 +16,9 @@ environment needed on the target machine) or run directly from source.
 - **[reference.md](reference.md)** -- exhaustive reference: every CLI flag, and the
   importable Python API (`lavlab.geojson`, `lavlab.seg`) for use outside
   the CLI, e.g. from a notebook.
+- **[monai.md](monai.md)** -- training on `lavlab tile` output with MONAI:
+  datasets over an extracted manifest or live from OMERO (optional
+  `monai` extra).
 - **[../CONTRIBUTING.md](../CONTRIBUTING.md)** -- setting up a dev
   environment, running tests, the pattern to follow when adding a new
   command group, and the conventions this codebase expects.

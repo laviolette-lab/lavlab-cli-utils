@@ -19,6 +19,7 @@ from lavlab.commands._shared import (
     add_creds_args,
     add_override_arg,
     connect_from_args,
+    get_image,
     group_of,
     parse_target,
 )
@@ -619,10 +620,10 @@ def run(args: argparse.Namespace) -> None:
     _validate_args(args)
     _explain_erosion(_build_params(args))
     target = parse_target(args.target)
-    if target == "batch":
-        _run_batch(args)
-    else:
+    if isinstance(target, int):
         _run_single(args, target)
+    else:
+        _run_batch(args)
 
 
 def _tile_one(conn, image, args: argparse.Namespace, params):
@@ -860,7 +861,7 @@ def _tile_with_retries(image_id: int):
             # Inside the try: a login that fails here is handled below like
             # any other error, instead of escaping the worker.
             conn = _worker_conn(args)
-            image = conn.getObject("Image", image_id)
+            image = get_image(conn, image_id)
             if image is None:
                 log.warning("Image %d not found, skipping.", image_id)
                 return SlideResult(image_id, "failed", reason="not found")

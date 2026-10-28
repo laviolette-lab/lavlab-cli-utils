@@ -500,7 +500,7 @@ def run_export(args: argparse.Namespace) -> None:
             for warning in result.warnings:
                 print(f"    {warning}")
 
-            if not args.skip_local:
+            if not args.skip_local and outdir is not None:
                 target = outdir / filename
                 if target.exists() and not (args.overwrite or args.dry_run):
                     raise SystemExit(

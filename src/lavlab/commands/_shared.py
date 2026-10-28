@@ -186,6 +186,25 @@ def parse_target(target: str) -> int | str:
         ) from None
 
 
+def get_image(conn, image_id: int):
+    """Look an image up across every group the user belongs to.
+
+    A batch worker's connection is left scoped to the previous image's group
+    by :func:`group_of`, and a lookup scoped to one group cannot see an image
+    in another -- it returns None, which reads as "not found". So the lookup
+    is unscoped first; :func:`group_of` then switches into the image's own.
+
+    :param conn: a connected gateway
+    :param image_id: the OMERO image ID
+    :type image_id: int
+    :return: the ``ImageWrapper``, or None if the user can't see it
+    """
+    from lavlab.omero_client import ALL_GROUPS
+
+    conn.SERVICE_OPTS.setOmeroGroup(ALL_GROUPS)
+    return conn.getObject("Image", image_id)
+
+
 def group_of(conn, obj) -> int:
     from lavlab.omero_client import switch_to_object_group
 

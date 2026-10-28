@@ -40,6 +40,14 @@ caught, not unit tests of individual functions. If you change anything in
 the DICOM SEG read/write path, re-verify the round trip still holds, don't
 just check that the function you touched doesn't raise.
 
+`tests/test_monai.py`'s reader and dataset tests need the optional `monai`
+extra (MONAI and PyTorch) and are skipped without it; its datalist tests,
+which keep `lavlab.monai.build_datalist` in step with `lavlab tile`, run
+either way. `make test-monai` (`hatch run test-monai:test`) runs them with
+the extra installed, as CI does. If you touch tile selection in
+`src/lavlab/tiling.py`, run them: they are what catches the two paths
+drifting apart.
+
 ## The command-group pattern
 
 Every CLI command group follows the same shape. If you're adding a new

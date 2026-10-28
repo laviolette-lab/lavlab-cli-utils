@@ -7,9 +7,31 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial, update_wrapper
 
 log = logging.getLogger(__name__)
+
+
+def run_sync(coro):
+    """Run *coro* to completion and return its result, from synchronous code.
+
+    ``asyncio.run`` refuses to start when the calling thread already runs an
+    event loop -- as a Jupyter kernel's main thread always does -- so there
+    the coroutine runs on its own loop in a short-lived worker thread
+    instead, and this call blocks until it finishes. Everywhere else it is
+    plain ``asyncio.run``. :func:`ice_async` hands Ice's callbacks to its
+    loop with ``call_soon_threadsafe``, so either way is safe.
+
+    :param coro: the coroutine to run; not yet started
+    :return: the coroutine's result
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="lavlab-async") as pool:
+        return pool.submit(asyncio.run, coro).result()
 
 
 def _firstline_truncate(s) -> str:

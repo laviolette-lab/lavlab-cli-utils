@@ -217,7 +217,7 @@ def fetch_large_recon(
     img = None
     tier: Tier = "network"
 
-    if have_local:
+    if have_local and src_path is not None:
         log.info(
             "Image %d: no usable cache; generating from local source %s...",
             image_id,

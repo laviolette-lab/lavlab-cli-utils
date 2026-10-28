@@ -37,5 +37,6 @@ plugins:
 
 nav:
   - Home: index.md
+  - Training with MONAI: monai.md
   - API Reference: api.md
   - CLI Reference: reference.md
