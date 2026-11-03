@@ -2279,9 +2279,12 @@ def test_tile_selection_is_pinned_for_a_fixed_slide_and_seed(mocked_slide, tmp_p
     ]
 
 
-# Recorded from the reader as it was before --tier existed; see the test below.
+# The pixels, manifest and tile metadata of the reader as it was before
+# --tier existed (see _output_digest and the test below). Re-derived from
+# the original PNG-bytes pin (5bf18038...), which the current reader still
+# matched on the machine it was recorded on; equal on Ubuntu CI.
 _PINNED_OUTPUT_SHA256 = (
-    "5bf180383b0da94e6b9a6701d0294a4343bc0a8d16781a870c0a9090698bec98"
+    "06088c656f787b5f7ff779085bdd2f042d9b7e761ea63f9972b7997e4300559c"
 )
 
 
@@ -2330,14 +2333,28 @@ def _real_params():
 
 
 def _output_digest(out):
-    """SHA-256 over the slide's manifest and every tile, in manifest order."""
+    """SHA-256 of what a slide's tiling produced, independent of the platform.
+
+    Covers the manifest's bytes and, per tile in manifest order, its path,
+    its *decoded* pixels and the metadata embedded in it. Not the files'
+    bytes: libvips versions encode identical pixels into different PNG
+    streams (8.15 on Ubuntu CI vs 8.18 from Homebrew), so a byte pin only
+    holds on one machine. The embedded ``lavlab_version`` is dropped, or
+    every release would break the pin.
+    """
     import hashlib
 
     slide_dir = out / "N101" / "N101_S08_HE"
     digest = hashlib.sha256((slide_dir / tiling.MANIFEST_NAME).read_bytes())
     for row in tiling.read_manifest(str(slide_dir)):
+        image = pyvips.Image.new_from_file(str(out / row["tile_path"]))
+        pixels = np.ascontiguousarray(image.numpy())
+        metadata = json.loads(image.get("png-comment-0-lavlab"))
+        metadata.pop("lavlab_version")
         digest.update(row["tile_path"].encode())
-        digest.update((out / row["tile_path"]).read_bytes())
+        digest.update(repr((pixels.shape, str(pixels.dtype))).encode())
+        digest.update(pixels.tobytes())
+        digest.update(json.dumps(metadata, sort_keys=True).encode())
     return digest.hexdigest()
 
 

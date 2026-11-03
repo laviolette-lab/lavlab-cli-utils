@@ -529,9 +529,9 @@ def test_a_label_map_that_vanishes_mid_run_fails_no_slide(
     labels.write_text("Cancer: [g3, g4]\n")
 
     def tile_one(conn, image, args, params):
-        # The mount drops as soon as the first slide starts.
-        if labels.exists():
-            labels.unlink()
+        # The mount drops as soon as the first slide starts. missing_ok: the
+        # workers race to it, and the loser must not fail its slide here.
+        labels.unlink(missing_ok=True)
         if params.label_map != {"Cancer": ["g3", "g4"]}:
             raise RuntimeError("label map was not carried into the worker")
         return SlideResult(image.getId(), "done", label_counts=Counter(Cancer=1))
