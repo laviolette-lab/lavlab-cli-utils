@@ -97,7 +97,12 @@ def scipy_nuitka_flags() -> list[str]:
     return []
 
 
-NOT_IN_BINARY = ["lavlab.monai", "monai", "torch"]
+# zarr: the tifffile local reader's region access (lavlab.tiling
+# TifffileRegionReader, the 'lavlab-cli-utils[tifffile]' extra). tifffile and
+# imagecodecs are already in the binary for `lavlab lr` and the tile
+# thumbnail; zarr is not, so the binary's `lavlab tile` skips that reader and
+# falls forward from pyvips straight to the OMERO tile API.
+NOT_IN_BINARY = ["lavlab.monai", "monai", "torch", "zarr"]
 
 
 def native_target() -> str:

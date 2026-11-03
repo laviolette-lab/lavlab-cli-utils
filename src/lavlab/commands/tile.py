@@ -36,6 +36,9 @@ DEFAULT_MAX_BACKGROUND_TILES = 2000
 DEFAULT_EXCLUDE_TEXT = ("exclusion roi",)
 DEFAULT_JPEG_QUALITY = 90
 DEFAULT_CONNECTIONS = 4
+# lavlab.tiling.TIERS, spelled out here: importing lavlab.tiling pulls in
+# numpy, which --help must not need (see lavlab/cli.py).
+TIERS = ("auto", "local", "network")
 
 DESCRIPTION = f"""\
 Cut whole-slide images from OMERO into fixed-size image tiles, for training
@@ -392,6 +395,16 @@ def add_parser(subparsers) -> None:
         "default these are fetched over the network instead, because reading "
         "them locally decodes the whole file for every tile.",
     )
+    running.add_argument(
+        "--tier",
+        choices=TIERS,
+        default="auto",
+        help="Where pixels come from. 'auto' (default) reads the original file "
+        "when OMERO's repository is mounted here and a test read of it "
+        "succeeds, and otherwise uses the OMERO tile API. 'network' always "
+        "uses the tile API. 'local' always reads the file, and fails the slide "
+        "instead of falling back.",
+    )
     parser.set_defaults(handler=run)
 
 
@@ -640,6 +653,7 @@ def _tile_one(conn, image, args: argparse.Namespace, params):
         manifest_path=args.manifest,
         dry_run=args.dry_run,
         store_count=args.connections,
+        tier=args.tier,
     )
 
 
@@ -716,7 +730,7 @@ def _print_report(result, params) -> None:
 
 
 def _run_single(args: argparse.Namespace, image_id: int) -> None:
-    from lavlab.tiling import TilingError
+    from lavlab.tiling import TifffileUnavailableError, TilingError
 
     params = _build_params(args)
     conn = connect_from_args(args)
@@ -728,7 +742,9 @@ def _run_single(args: argparse.Namespace, image_id: int) -> None:
 
         try:
             result = _tile_one(conn, image, args, params)
-        except TilingError as exc:
+        except (TilingError, TifffileUnavailableError) as exc:
+            # TifffileUnavailableError: --tier local on a source only the
+            # tifffile reader could read; its message is the install command.
             raise SystemExit(f"error: image {image_id}: {exc}") from None
         except Exception as exc:
             from lavlab.omero_client import describe_error, is_resource_error
@@ -850,7 +866,7 @@ def _process_one(image_id: int):
 def _tile_with_retries(image_id: int):
     """Tile one slide, reconnecting only for genuine connection failures."""
     from lavlab.omero_client import describe_error, is_conn_error, is_resource_error
-    from lavlab.tiling import SlideResult, TilingError
+    from lavlab.tiling import SlideResult, TifffileUnavailableError, TilingError
 
     args = _WORKER_STATE["args"]
     params = _WORKER_STATE["params"]
@@ -867,7 +883,7 @@ def _tile_with_retries(image_id: int):
                 return SlideResult(image_id, "failed", reason="not found")
             group_of(conn, image)
             return _tile_one(conn, image, args, params)
-        except TilingError as exc:
+        except (TilingError, TifffileUnavailableError) as exc:
             log.warning("Image %d: %s", image_id, exc)
             return SlideResult(image_id, "failed", reason=str(exc))
         except Exception as exc:

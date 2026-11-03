@@ -66,6 +66,9 @@ jobs:
         run: |
           pip install -r build-requirements.txt
           pip install pytest pytest-cov "coverage[toml]>=6.2"
+          # The [tifffile] extra's one package not already in
+          # build-requirements.txt, so its reader's tests run, not skip.
+          pip install zarr
 
       - name: Run pytest and generate coverage report
         run: |

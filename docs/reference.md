@@ -149,6 +149,7 @@ lavlab tile <image-id | batch> -o DIR (--whole | --roi)
                                 [--format png|jpg|jpeg] [--quality N]
                                 [--manifest PATH] [--coords-only] [--dry-run]
                                 [--skip-existing] [--force-local]
+                                [--tier auto|local|network]
                                 [-g GROUP] [--workers N] [--connections N]
                                 [creds...]
 ```
@@ -216,6 +217,7 @@ examples.
 |---|---|
 | `--skip-existing` | Skip slides already tiled with these same parameters, and resume an interrupted slide from the tiles it already wrote. A finished slide tiled with different parameters is warned about and skipped; `--override` re-tiles it |
 | `--force-local` | Read a JPEG-2000 source locally instead of falling forward to the network tier |
+| `--tier` | `auto` (default): probe the local source and fall forward, see *Pixel tiers*. `network`: always the OMERO tile API, even with a mounted, readable source. `local`: always the local source; a slide it cannot read fails rather than falling back (implies `--force-local`) |
 | `-g`, `--group` | OMERO group ID -- batch mode only |
 | `--workers` | Slides tiled in parallel in batch mode (default: 8) |
 | `--connections` | Parallel OMERO raw-pixels stores per slide for network reads (default: 4) |
@@ -368,11 +370,38 @@ front: the bundled libvips has no jp2k loader, so random access would fall
 to Pillow decoding the whole codestream per crop. `--force-local`
 overrides.
 
+**Local readers and the probe** (`::probe_local_reader`). Opening the file
+proves nothing: part of the archive is tiled OME-TIFF with separate colour
+planes (`planarconfig` SEPARATE), which libvips opens -- metadata, pyramid,
+level descriptors -- and then refuses at the first pixel read (`tiff2vips:
+tiled separate planes not supported`). So with `--tier auto` each local
+reader in turn reads one real region at every pyramid level the run uses,
+through the same `read` the tiles use, and the first to succeed serves the
+whole slide:
+
+1. **pyvips** (`LocalRegionReader`), the default.
+2. **tifffile** (`TifffileRegionReader`): `series.aszarr(level=N)` opened
+   with zarr and sliced. A contiguous-plane series comes back `YXS`, a
+   separate-plane one `SYX`; the reader orders axes from `series.axes`, so
+   both return `(h, w, bands)`. Needs the optional extra, `pip install
+   'lavlab-cli-utils[tifffile]'` (tifffile, imagecodecs for the JPEG tiles,
+   zarr), imported only inside the reader. It is not in the binary (zarr is
+   excluded in `build_native.py`), so there this step is skipped.
+3. **The network tier.**
+
+A reader that fails logs one `WARNING` line and the next is tried; a
+missing extra is skipped silently. `--tier local` stops after step 2 and
+raises instead -- a `TilingError` for an unreadable source, an
+`ImportError` naming the extra when only tifffile could have read it. The
+manifest's `tier` column says `local` for either local reader.
+
 Both tiers go through one grid, one region-reader interface and one
 `resize_tile` call, so they select the same tiles and the same level.
 They do **not** guarantee bit-identical pixels: tier 2 reads the source
 file's pyramid and tier 3 reads OMERO's, which can differ by a
-quantization step on lossily-compressed levels.
+quantization step on lossily-compressed levels. The two local readers
+decode the same file and matched pixel for pixel in testing, but are
+different decoder builds.
 
 **Single-image output.** A finished slide prints its counts, any tiles
 reused by a resume, and how many ROIs `--erode` left no room in. With

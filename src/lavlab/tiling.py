@@ -16,6 +16,13 @@ Pixels come from one of two tiers, mirroring ``lavlab.large_recon``:
   pyramid.
 * **network** -- otherwise, regions are fetched through OMERO's tile API.
 
+A mounted file is not proof that it can be read: libvips opens a tiled TIFF
+that stores each colour plane separately, and fails only on the first pixel
+read. So the local tier is settled by cutting one real region (see
+:func:`probe_local_reader`) with pyvips, then with tifffile if the optional
+``tifffile`` extra is installed, before falling forward to the network.
+``--tier`` (:data:`TIERS`) pins either tier instead.
+
 Everything expensive is decided at *analysis resolution*: one coarse
 thumbnail per slide (~8 samples across a tile) carries the tissue mask and
 the rasterised ROIs, and integral images turn "what fraction of this tile
@@ -79,7 +86,28 @@ class UnreadableSourceError(TilingError):
     """
 
 
+class TifffileUnavailableError(ImportError):
+    """Raised when the optional ``tifffile`` reader extra is not installed.
+
+    An :class:`ImportError`, so it is one of :func:`_local_source_errors`;
+    separate so ``--tier auto`` can skip the tifffile reader without a
+    warning -- a missing optional dependency is not a fault -- while
+    ``--tier local`` reports it with the install command.
+    """
+
+
 SUBSAMPLES_PER_TILE = 8
+
+# --tier: "auto" probes the local source and falls forward to the network;
+# "local" and "network" pin one tier and never fall back.
+TIERS = ("auto", "local", "network")
+
+# Local readers in the order --tier auto tries them. pyvips stays first: it
+# is a hard dependency and fast on contiguous-plane TIFFs, and tifffile is
+# only reached for files libvips cannot read.
+LOCAL_READERS = ("pyvips", "tifffile")
+
+TIFFFILE_EXTRA = "lavlab-cli-utils[tifffile]"
 
 DEFAULT_EXCLUDE_TEXT = ("exclusion roi",)
 
@@ -1159,6 +1187,134 @@ class LocalRegionReader:
         self._image = None
 
 
+def _import_tifffile_reader():
+    """Import the optional ``tifffile`` extra, or say how to install it.
+
+    :return: the ``(tifffile, zarr)`` modules
+    :raises TifffileUnavailableError: if any of the extra is missing
+    """
+    try:
+        # tifffile hands JPEG tile decoding to imagecodecs and only fails on
+        # the first tile without it, so check for it up front.
+        import imagecodecs  # noqa: F401
+        import tifffile
+        import zarr
+    except ImportError as exc:
+        raise TifffileUnavailableError(
+            f"the tifffile local reader needs the optional '{TIFFFILE_EXTRA}' "
+            f"extra ({exc}); install it with: pip install '{TIFFFILE_EXTRA}'"
+        ) from exc
+    return tifffile, zarr
+
+
+class TifffileRegionReader:
+    """Tier 2 through tifffile, for sources libvips cannot read.
+
+    libvips refuses tiled TIFFs that store each colour plane separately
+    (``planarconfig`` SEPARATE). tifffile reads both layouts, but returns
+    them in different axis orders -- ``YXS`` for contiguous planes, ``SYX``
+    for separate ones -- so the order is taken from the series' own axes
+    and every region comes back ``(h, w, bands)``, exactly what
+    :class:`LocalRegionReader` returns for the same region.
+
+    Needs the optional ``tifffile`` extra (:data:`TIFFFILE_EXTRA`), which is
+    imported here and nowhere else.
+    """
+
+    def __init__(self, src_path: str, plan: LevelPlan, level_wh: tuple[int, int]):
+        """
+        :param src_path: the source file
+        :type src_path: str
+        :param plan: the level and region size to read
+        :type plan: LevelPlan
+        :param level_wh: that level's ``(width, height)``
+        :type level_wh: tuple[int, int]
+        :raises TifffileUnavailableError: if the extra is not installed
+        :raises UnreadableSourceError: if the level is not a uint8 Y/X image
+            of the expected size
+        """
+        tifffile, zarr = _import_tifffile_reader()
+        self._plan = plan
+        self._level_wh = level_wh
+        self._tif = tifffile.TiffFile(src_path)
+        try:
+            series = self._tif.series[0]
+            axes = series.levels[plan.index].axes
+            if "Y" not in axes or "X" not in axes:
+                raise UnreadableSourceError(
+                    f"TIFF series in '{src_path}' has axes '{axes}' with no Y/X."
+                )
+            self._array = zarr.open(series.aszarr(level=plan.index), mode="r")
+            if self._array.dtype != np.uint8:
+                raise UnreadableSourceError(
+                    f"'{src_path}' level {plan.index} is {self._array.dtype}; "
+                    "local tiling only supports uint8."
+                )
+            shape = self._array.shape
+            found = (shape[axes.index("X")], shape[axes.index("Y")])
+            if found != tuple(level_wh):
+                raise UnreadableSourceError(
+                    f"level {plan.index} of '{src_path}' is {found[0]}x{found[1]}, "
+                    f"expected {level_wh[0]}x{level_wh[1]}."
+                )
+        except BaseException:
+            self._tif.close()
+            raise
+        # Planes are "S" (samples, RGB) or "C" (OME channels); any other
+        # axis tifffile kept is a singleton Z/T and is indexed away.
+        self._bands_axis = "S" if "S" in axes else ("C" if "C" in axes else None)
+        self._axes = axes
+
+    def prefetch(self, regions: Sequence[tuple[int, int, int, int]]) -> None:
+        """No-op: a mounted file needs no batching."""
+
+    def read(self, x0: int, y0: int, w0: int, h0: int) -> np.ndarray:
+        """Read one level-0 region, returned at the chosen pyramid level.
+
+        :param x0: level-0 left edge
+        :type x0: int
+        :param y0: level-0 top edge
+        :type y0: int
+        :param w0: level-0 width
+        :type w0: int
+        :param h0: level-0 height
+        :type h0: int
+        :return: an ``(read_size, read_size, bands)`` uint8 array
+        :rtype: numpy.ndarray
+        """
+        size = self._plan.read_size
+        level_w, level_h = self._level_wh
+        x = min(max(int(round(x0 / self._plan.downsample)), 0), max(level_w - size, 0))
+        y = min(max(int(round(y0 / self._plan.downsample)), 0), max(level_h - size, 0))
+        width = min(size, level_w - x)
+        height = min(size, level_h - y)
+
+        index: list[slice | int] = []
+        for axis in self._axes:
+            if axis == "Y":
+                index.append(slice(y, y + height))
+            elif axis == "X":
+                index.append(slice(x, x + width))
+            elif axis == self._bands_axis:
+                index.append(slice(None))
+            else:
+                index.append(0)
+        region = np.asarray(self._array[tuple(index)])
+
+        kept = [a for a in self._axes if a in ("Y", "X", self._bands_axis)]
+        if self._bands_axis is None:
+            region = region[..., np.newaxis]
+            kept.append("bands")
+        else:
+            kept = ["bands" if a == self._bands_axis else a for a in kept]
+        order = [kept.index(a) for a in ("Y", "X", "bands")]
+        return np.ascontiguousarray(region.transpose(order))
+
+    def close(self) -> None:
+        self._array = None
+        self._tif.close()
+
+
 class NetworkRegionReader:
     """Tier 3: fetch regions through OMERO's tile API.
 
@@ -1942,6 +2098,101 @@ def warn_local_fallback(
     )
 
 
+def open_local_reader(
+    name: str, src_path: str, plan: LevelPlan, level_wh: tuple[int, int]
+) -> LocalRegionReader | TifffileRegionReader:
+    """Open one of :data:`LOCAL_READERS` on a pyramid level.
+
+    :param name: ``"pyvips"`` or ``"tifffile"``
+    :type name: str
+    :param src_path: the source file
+    :type src_path: str
+    :param plan: the level and region size to read
+    :type plan: LevelPlan
+    :param level_wh: that level's ``(width, height)``
+    :type level_wh: tuple[int, int]
+    :return: a region reader
+    """
+    if name == "tifffile":
+        return TifffileRegionReader(src_path, plan, level_wh)
+    if name == "pyvips":
+        return LocalRegionReader(src_path, plan, level_wh)
+    raise ValueError(f"unknown local reader {name!r}; expected one of {LOCAL_READERS}")
+
+
+def probe_local_reader(
+    image_id: int,
+    src_path: str,
+    plans: Sequence[LevelPlan],
+    level_dims: Sequence[tuple[int, int]],
+    region: tuple[int, int, int, int],
+    *,
+    required: bool = False,
+) -> str:
+    """Return the first local reader that can actually read this source.
+
+    Opening a file proves little: libvips opens a separate-plane tiled TIFF
+    and reads its pyramid without complaint, then fails on the first pixel
+    read. So each of :data:`LOCAL_READERS` in turn cuts *region* at every
+    pyramid level in *plans*, through the same ``read`` the tiles go
+    through, and the first to manage all of them serves the whole slide.
+
+    A reader that fails is logged at WARNING and the next is tried. A
+    tifffile reader that is not installed is skipped without one, unless
+    *required*, when its :class:`TifffileUnavailableError` is what is raised.
+
+    :param image_id: the OMERO image ID, for the log
+    :type image_id: int
+    :param src_path: the source file
+    :type src_path: str
+    :param plans: the level plans the run will read, one per output scale
+    :type plans: Sequence[LevelPlan]
+    :param level_dims: ``(width, height)`` per local pyramid level
+    :type level_dims: Sequence[tuple[int, int]]
+    :param region: a level-0 ``(x0, y0, w0, h0)`` region to read
+    :type region: tuple[int, int, int, int]
+    :param required: ``--tier local``: report a missing tifffile extra
+        rather than the pyvips failure that led to it
+    :type required: bool
+    :return: the name of the reader to use
+    :rtype: str
+    :raises Exception: one of :func:`_local_source_errors`, if no local
+        reader can serve this source
+    """
+    levels = {plan.index: plan for plan in plans}
+    failure: BaseException | None = None
+    for name in LOCAL_READERS:
+        try:
+            for index, plan in sorted(levels.items()):
+                reader = open_local_reader(name, src_path, plan, level_dims[index])
+                try:
+                    reader.read(*region)
+                finally:
+                    reader.close()
+        except TifffileUnavailableError as exc:
+            if required:
+                raise exc from failure
+            log.debug("Image %d: tifffile reader skipped -- %s", image_id, exc)
+            continue
+        except _local_source_errors() as exc:
+            log.warning(
+                "Image %d: the %s reader cannot read '%s' -- %s: %s",
+                image_id,
+                name,
+                src_path,
+                type(exc).__name__,
+                str(exc).strip().replace("\n", " "),
+            )
+            failure = exc
+            continue
+        if failure is not None:
+            log.info("Image %d: reading '%s' with %s.", image_id, src_path, name)
+        return name
+    if failure is None:  # pragma: no cover - LOCAL_READERS is never empty
+        raise UnreadableSourceError(f"no local reader for '{src_path}'.")
+    raise failure
+
+
 def network_level_dims(conn, image) -> list[tuple[int, int]]:
     """Return ``(width, height)`` per pyramid level as OMERO reports them.
 
@@ -2279,6 +2530,8 @@ class SlideSelection:
     tiles: list[GridTile]
     analysis_ds: int = 0
     tier: str | None = None
+    # With tier "local", which of LOCAL_READERS the probe settled on.
+    local_reader: str | None = None
     src_path: str | None = None
     level_dims: list[tuple[int, int]] = field(default_factory=list)
     # One per entry of scale_ds.
@@ -2343,14 +2596,19 @@ def select_tiles(
     params: TileParams,
     *,
     force_local: bool = False,
+    tier: str = "auto",
 ) -> SlideSelection:
-    """Decide every tile a slide yields, reading no full-resolution pixels.
+    """Decide every tile a slide yields, reading one full-resolution region.
 
     Resolves the output scales, lays the grid at the finest one, picks the
     pixel tier (local source or OMERO tile API, falling forward with a
     WARNING), loads the analysis thumbnail and ROIs, labels every grid cell
     with :func:`analyze_slide`, drops concentric crops that would run off the
     slide, and applies the seeded caps with :func:`sample_records`.
+
+    The one region read is the local tier's probe
+    (:func:`probe_local_reader`), which settles which local reader -- if
+    any -- can serve the slide before a single tile is committed to it.
 
     Shared by :func:`tile_slide` and ``lavlab.monai.build_datalist`` so the
     tiles written to disk and the samples handed to a training framework
@@ -2362,11 +2620,22 @@ def select_tiles(
     :type params: TileParams
     :param force_local: read a JPEG-2000 source locally anyway
     :type force_local: bool
+    :param tier: one of :data:`TIERS`. ``"auto"`` reads locally when it can
+        and falls forward to the network; ``"local"`` raises instead of
+        falling back (and reads JPEG-2000 sources locally); ``"network"``
+        never touches the local source.
+    :type tier: str
     :return: the selection; check :attr:`SlideSelection.status` first
     :rtype: SlideSelection
     :raises MissingPixelSizeError: with ``mpp`` but no recorded pixel size
-    :raises TilingError: for a slide that cannot be tiled as asked
+    :raises TilingError: for a slide that cannot be tiled as asked, including
+        one ``tier="local"`` cannot read locally
+    :raises TifffileUnavailableError: with ``tier="local"``, for a source
+        only the tifffile reader could read, when it is not installed
     """
+    if tier not in TIERS:
+        raise ValueError(f"tier must be one of {TIERS}, got {tier!r}")
+    requested_tier = tier
     image_id = int(image.getId())
     width0 = int(image.getSizeX())
     height0 = int(image.getSizeY())
@@ -2412,25 +2681,63 @@ def select_tiles(
         return selection
 
     analysis_ds = analysis_downsample(tiles[0].w0)
-    tier, src_path = choose_tier(conn, image_id, force_local=force_local)
+    src_path: str | None
+    if requested_tier == "network":
+        tier, src_path = "network", None
+    else:
+        tier, src_path = choose_tier(
+            conn, image_id, force_local=force_local or requested_tier == "local"
+        )
+        if requested_tier == "local" and (tier != "local" or src_path is None):
+            raise TilingError(
+                "--tier local, but "
+                + (
+                    "OMERO reports no original file for it."
+                    if src_path is None
+                    else f"its original '{src_path}' is not readable here."
+                )
+            )
+
+    def plans_for(dims: list[tuple[int, int]]) -> list[LevelPlan]:
+        widths = [w for w, _h in dims]
+        return [select_level(widths, width0, ds, params.size) for _m, ds in scale_ds]
 
     thumbnail = None
     level_dims: list[tuple[int, int]] = []
+    local_reader = None
     if tier == "local" and src_path is not None:
         try:
             level_dims = local_level_dims(src_path)
+            probe = tiles[len(tiles) // 2]
+            local_reader = probe_local_reader(
+                image_id,
+                src_path,
+                plans_for(level_dims),
+                level_dims,
+                (probe.x0, probe.y0, probe.w0, probe.h0),
+                required=requested_tier == "local",
+            )
             thumbnail = _load_thumbnail_local(src_path, analysis_ds)
+        except TifffileUnavailableError:
+            # Only escapes probe_local_reader under --tier local, and goes
+            # out as is: it names the extra to install.
+            raise
         except _local_source_errors() as exc:
+            if requested_tier == "local":
+                raise TilingError(
+                    f"--tier local, but '{src_path}' cannot be read locally -- "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
             warn_local_fallback(image_id, src_path, exc)
             tier = "network"
             thumbnail = None
+            local_reader = None
 
     if thumbnail is None:
         level_dims = network_level_dims(conn, image)
         thumbnail = _load_thumbnail_network(conn, image, analysis_ds)
 
-    level_widths = [w for w, _h in level_dims]
-    plans = [select_level(level_widths, width0, ds, params.size) for _m, ds in scale_ds]
+    plans = plans_for(level_dims)
     plan = plans[0]
     log.info(
         "Image %d: %d grid tiles, tier %s, pyramid level %d (x%.2f), analysis 1/%d.",
@@ -2443,6 +2750,7 @@ def select_tiles(
     )
     selection.analysis_ds = analysis_ds
     selection.tier = tier
+    selection.local_reader = local_reader
     selection.src_path = src_path
     selection.level_dims = level_dims
     selection.plans = plans
@@ -2570,6 +2878,7 @@ def tile_slide(
     manifest_path: str | None = None,
     dry_run: bool = False,
     store_count: int | None = None,
+    tier: str = "auto",
 ) -> SlideResult:
     """Tile one slide into ``<out_root>/<subject>/<stem>/``.
 
@@ -2593,6 +2902,8 @@ def tile_slide(
     :type dry_run: bool
     :param store_count: parallel raw-pixels stores for network reads
     :type store_count: int | None
+    :param tier: one of :data:`TIERS`; see :func:`select_tiles`
+    :type tier: str
     :return: what happened
     :rtype: SlideResult
     :raises TilingError: for a slide that cannot be tiled as asked
@@ -2639,7 +2950,7 @@ def tile_slide(
         and params_match(read_tile_params(slide_dir), params)
     )
 
-    selection = select_tiles(conn, image, params, force_local=force_local)
+    selection = select_tiles(conn, image, params, force_local=force_local, tier=tier)
     if selection.status == "empty":
         return SlideResult(
             image_id,
@@ -2658,7 +2969,7 @@ def tile_slide(
             dry_run=dry_run,
         )
 
-    tier = selection.tier
+    served_tier = selection.tier
     src_path = selection.src_path
     level_dims = selection.level_dims
     tiles = selection.tiles
@@ -2676,7 +2987,7 @@ def tile_slide(
     erode_um = selection.erode_um
 
     common: dict[str, Any] = {
-        "tier": tier,
+        "tier": served_tier,
         "label_counts": label_counts,
         "stats": stats,
         "slide_dir": slide_dir,
@@ -2726,7 +3037,7 @@ def tile_slide(
                 _plan,
                 params,
                 _mpp,
-                tier,
+                served_tier,
                 selection.roi_id(record),
             )
 
@@ -2754,10 +3065,13 @@ def tile_slide(
                 todo.append((index, record, tile_path))
 
         if todo:
-            reader: LocalRegionReader | NetworkRegionReader
-            if tier == "local" and src_path is not None:
-                reader = LocalRegionReader(
-                    src_path, scale_plan, level_dims[scale_plan.index]
+            reader: LocalRegionReader | TifffileRegionReader | NetworkRegionReader
+            if served_tier == "local" and src_path is not None:
+                reader = open_local_reader(
+                    selection.local_reader or LOCAL_READERS[0],
+                    src_path,
+                    scale_plan,
+                    level_dims[scale_plan.index],
                 )
             elif store_count:
                 reader = NetworkRegionReader(
@@ -2806,7 +3120,7 @@ def tile_slide(
         params,
         status="complete",
         **identity,
-        tier=tier,
+        tier=served_tier,
         level=plan.index,
         levels={
             str(mpp_s): p.index for (mpp_s, _ds), p in zip(scale_ds, plans, strict=True)

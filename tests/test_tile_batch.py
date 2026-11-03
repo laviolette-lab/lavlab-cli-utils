@@ -295,6 +295,29 @@ def test_a_resource_error_is_not_retried(worker, monkeypatch, caplog):
     assert "serverStackTrace" not in warning.getMessage()
 
 
+def test_a_missing_tifffile_extra_fails_one_slide_with_the_install_command(
+    worker, monkeypatch, caplog
+):
+    """--tier local on a source only tifffile can read, without the extra."""
+    from lavlab.tiling import TifffileUnavailableError
+
+    message = "install it with: pip install 'lavlab-cli-utils[tifffile]'"
+
+    def fake_tile_one(conn, image, args, params):
+        raise TifffileUnavailableError(message)
+
+    monkeypatch.setattr(tile_cmd, "_tile_one", fake_tile_one)
+
+    with caplog.at_level("WARNING"):
+        result = tile_cmd._process_one(885)
+
+    assert result.status == "failed"
+    assert result.reason == message
+    (warning,) = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert warning.getMessage() == f"Image 885: {message}"
+    assert warning.exc_info is None  # one line, not a traceback per slide
+
+
 def test_a_genuine_connection_loss_reconnects_and_closes_the_old_session(
     worker, monkeypatch
 ):
