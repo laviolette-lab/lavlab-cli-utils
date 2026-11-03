@@ -6,11 +6,13 @@
 :class:`OmeroWSIReader` is a ``monai.data.BaseWSIReader``: hand it to
 ``monai.data.PatchWSIDataset`` (or anything else that takes a WSI reader)
 and patches are read from OMERO on demand. Pixels come through the same two
-tiers ``lavlab tile`` uses -- :class:`lavlab.tiling.LocalRegionReader` on a
-mounted managed repository, :class:`lavlab.tiling.NetworkRegionReader`
-otherwise -- with the same fall-forward and JPEG-2000 rules, and are resized
-with :func:`lavlab.tiling.resize_tile`, so a patch read here is the tile
-``lavlab tile`` would have written.
+tiers ``lavlab tile`` uses -- a local reader on a mounted managed repository
+(:class:`lavlab.tiling.LocalRegionReader`, or
+:class:`lavlab.tiling.TifffileRegionReader` for files libvips cannot read),
+:class:`lavlab.tiling.NetworkRegionReader` otherwise -- chosen by the same
+probe (:func:`lavlab.tiling.probe_local_reader`) with the same fall-forward
+and JPEG-2000 rules, and are resized with :func:`lavlab.tiling.resize_tile`,
+so a patch read here is the tile ``lavlab tile`` would have written.
 
 Connections are per process. A ``DataLoader`` forks or spawns its workers
 from a parent that may already hold a session; an Ice session does not
@@ -31,9 +33,9 @@ import numpy as np
 from lavlab.monai._optional import EXTRA_HINT, is_missing_extra
 from lavlab.monai.datalist import _connect, claim_vips, image_uri, parse_image_id
 from lavlab.tiling import (
+    LOCAL_READERS,
     MISSING_PIXEL_SIZE_MESSAGE,
     LevelPlan,
-    LocalRegionReader,
     MissingPixelSizeError,
     NetworkRegionReader,
     TilingError,
@@ -42,6 +44,8 @@ from lavlab.tiling import (
     image_pixel_sizes,
     local_level_dims,
     network_level_dims,
+    open_local_reader,
+    probe_local_reader,
     resize_tile,
     warn_local_fallback,
 )
@@ -54,6 +58,10 @@ except ImportError as exc:  # pragma: no cover - depends on the install
     raise
 
 log = logging.getLogger(__name__)
+
+# Edge of the level-0 region :meth:`OmeroWSIReader.read` probes the local
+# source with: a few JPEG tiles' worth, enough to reach real pixels.
+_PROBE_SIZE = 256
 
 # Guards every per-process lazy initialisation below. A lock held by another
 # thread at fork time stays held, forever, in the child, so the child gets a
@@ -117,6 +125,18 @@ def _objective_power(image) -> float | None:
     return value if value > 0 else None
 
 
+def _probe_plan(level0_wh: tuple[int, int]) -> LevelPlan:
+    """A level-0 plan for :func:`lavlab.tiling.probe_local_reader`."""
+    size = max(1, min(_PROBE_SIZE, *level0_wh))
+    return LevelPlan(index=0, downsample=1.0, read_size=size, scale=1.0)
+
+
+def _probe_region(level0_wh: tuple[int, int]) -> tuple[int, int, int, int]:
+    """A region at the slide's centre, where the tissue usually is."""
+    width, height = level0_wh
+    return (width // 2, height // 2, _PROBE_SIZE, _PROBE_SIZE)
+
+
 class OmeroWSI:
     """An open OMERO image, as returned by :meth:`OmeroWSIReader.read`.
 
@@ -139,6 +159,7 @@ class OmeroWSI:
         tier: str,
         src_path: str | None,
         objective_power: float | None = None,
+        local_reader: str | None = None,
     ):
         """
         :param image_id: the OMERO image ID
@@ -159,6 +180,9 @@ class OmeroWSI:
         :type src_path: str | None
         :param objective_power: nominal magnification, if recorded
         :type objective_power: float | None
+        :param local_reader: with tier ``"local"``, which of
+            :data:`lavlab.tiling.LOCAL_READERS` serves it (None: the first)
+        :type local_reader: str | None
         """
         self.image_id = image_id
         self.width0 = width0
@@ -169,6 +193,7 @@ class OmeroWSI:
         self.tier = tier
         self.src_path = src_path
         self.objective_power = objective_power
+        self.local_reader = local_reader
         self._live: dict | None = None
 
     def __getstate__(self) -> dict:
@@ -177,9 +202,10 @@ class OmeroWSI:
         return state
 
     def __repr__(self) -> str:
+        reader = f", reader={self.local_reader}" if self.tier == "local" else ""
         return (
             f"OmeroWSI({image_uri(self.image_id)}, {self.width0}x{self.height0}, "
-            f"{len(self.level_dims)} levels, tier={self.tier})"
+            f"{len(self.level_dims)} levels, tier={self.tier}{reader})"
         )
 
 
@@ -351,9 +377,16 @@ class OmeroWSIReader(BaseWSIReader):
         """Open one OMERO image, or several.
 
         Picks the tier with :func:`lavlab.tiling.choose_tier` (so JPEG-2000
-        sources go over the network unless *force_local*), and reads the
-        pyramid from the local source, falling forward to OMERO's own
-        description of it with a WARNING if the source can't be read.
+        sources go over the network unless *force_local*), reads the
+        pyramid from the local source, and probes it with
+        :func:`lavlab.tiling.probe_local_reader` -- pyvips, then tifffile if
+        the optional extra is installed -- exactly as ``lavlab tile`` does.
+        If no local reader can, it falls forward to OMERO's tile API with a
+        WARNING.
+
+        The probe matters because libvips opens a separate-plane TIFF and
+        only fails on its first pixel read; without it, every patch of such a
+        slide would fail locally and fall forward mid-read.
 
         :param data: ``omero://<id>`` or an int, or a list/tuple of those
         :param kwargs: unused; accepted for the ``ImageReader`` interface
@@ -373,9 +406,20 @@ class OmeroWSIReader(BaseWSIReader):
             switch_to_object_group(conn, image)
             tier, src_path = choose_tier(conn, image_id, force_local=self.force_local)
             level_dims: list[tuple[int, int]] = []
+            local_reader = None
             if tier == "local" and src_path is not None:
                 try:
                     level_dims = local_level_dims(src_path)
+                    # The probe reads pixels through libvips: from here on a
+                    # fork of this process must fail fast, not hang.
+                    claim_vips()
+                    local_reader = probe_local_reader(
+                        image_id,
+                        src_path,
+                        [_probe_plan(level_dims[0])],
+                        level_dims,
+                        _probe_region(level_dims[0]),
+                    )
                 except _local_source_errors() as exc:
                     warn_local_fallback(image_id, src_path, exc)
                     tier = "network"
@@ -392,6 +436,7 @@ class OmeroWSIReader(BaseWSIReader):
                 tier=tier,
                 src_path=src_path,
                 objective_power=_objective_power(image),
+                local_reader=local_reader,
             )
             wsi._live = {
                 "pid": os.getpid(),
@@ -584,8 +629,11 @@ class OmeroWSIReader(BaseWSIReader):
                 wsi._live = live
             reader = live["readers"].get(key)
             if reader is None:
-                reader = LocalRegionReader(
-                    wsi.src_path, plan, wsi.level_dims[plan.index]
+                reader = open_local_reader(
+                    wsi.local_reader or LOCAL_READERS[0],
+                    wsi.src_path,
+                    plan,
+                    wsi.level_dims[plan.index],
                 )
                 live["readers"][key] = reader
         return reader.read(x0, y0, w0, h0)

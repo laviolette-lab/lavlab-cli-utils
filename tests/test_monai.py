@@ -760,6 +760,119 @@ def test_reader_falls_forward_mid_read(omero_world, tmp_path, caplog):
     assert any("Falling back to tier 3" in r.getMessage() for r in caplog.records)
 
 
+def _write_separate_plane_pyramid(path, base):
+    """``_write_pyramid``'s levels, stored plane-first (planarconfig SEPARATE).
+
+    The layout libvips opens but cannot read -- about half the archive.
+    """
+    options = dict(tile=(64, 64), photometric="rgb", planarconfig="separate")
+    with tifffile.TiffWriter(str(path), bigtiff=True) as writer:
+        for level in range(LEVELS):
+            step = 2**level
+            planes = np.ascontiguousarray(np.moveaxis(base[::step, ::step], -1, 0))
+            writer.write(planes, subfiletype=1 if level else 0, **options)
+
+
+def _hide_tifffile_extra(monkeypatch):
+    for name in ("zarr", "imagecodecs"):
+        monkeypatch.setitem(sys.modules, name, None)
+
+
+@needs_monai
+def test_reader_reads_a_separate_plane_slide_locally_through_tifffile(
+    omero_world, tmp_path, caplog
+):
+    """libvips fails the probe at open; tifffile serves every patch, locally."""
+    pytest.importorskip("zarr")
+    pytest.importorskip("imagecodecs")
+    separate = tmp_path / "separate.tiff"
+    _write_separate_plane_pyramid(separate, omero_world.base)
+    omero_world.sources[1962] = str(separate)
+    reader = _reader(omero_world)
+
+    with caplog.at_level("WARNING"):
+        wsi = reader.read("omero://1962")
+        patches = [
+            reader.get_data(wsi, location=(96, 96), size=(32, 32), level=1),
+            reader.get_data(wsi, location=(7, 9), size=(70, 70), level=0),
+        ]
+
+    assert (wsi.tier, wsi.local_reader) == ("local", "tifffile")
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1  # the probe's, at open -- not one per patch
+    assert "pyvips reader cannot read" in warnings[0]
+    level1 = omero_world.base[::2, ::2]
+    expected_regions = (  # location is (row, col)
+        level1[48:80, 48:80],
+        omero_world.base[7:77, 9:79],
+    )
+    for (patch, meta), expected in zip(patches, expected_regions):
+        assert np.array_equal(np.moveaxis(patch, 0, -1), expected)
+        assert meta["tier"] == "local"
+    assert omero_world.network_reads == 0
+
+
+@needs_monai
+def test_separate_and_contiguous_slides_read_identical_patches(omero_world, tmp_path):
+    pytest.importorskip("zarr")
+    pytest.importorskip("imagecodecs")
+    contiguous = _reader(omero_world, resize_to=32)
+    contiguous_wsi = contiguous.read("omero://1962")
+    separate_path = tmp_path / "separate.tiff"
+    _write_separate_plane_pyramid(separate_path, omero_world.base)
+    omero_world.sources[1962] = str(separate_path)
+    separate = _reader(omero_world, resize_to=32)
+    separate_wsi = separate.read("omero://1962")
+
+    assert contiguous_wsi.local_reader == "pyvips"
+    assert separate_wsi.local_reader == "tifffile"
+    for location, size, level in (((96, 96), 48, 1), ((40, 300), 32, 2)):
+        a, _ = contiguous.get_data(
+            contiguous_wsi, location=location, size=(size, size), level=level
+        )
+        b, _ = separate.get_data(
+            separate_wsi, location=location, size=(size, size), level=level
+        )
+        assert np.array_equal(a, b)
+
+
+@needs_monai
+def test_reader_without_the_tifffile_extra_falls_forward_at_open(
+    omero_world, tmp_path, monkeypatch, caplog
+):
+    separate = tmp_path / "separate.tiff"
+    _write_separate_plane_pyramid(separate, omero_world.base)
+    omero_world.sources[1962] = str(separate)
+    _hide_tifffile_extra(monkeypatch)
+    reader = _reader(omero_world)
+
+    with caplog.at_level("WARNING"):
+        wsi = reader.read("omero://1962")
+        patch, meta = reader.get_data(wsi, location=(96, 96), size=(32, 32), level=1)
+
+    assert wsi.tier == "network"
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert "pyvips reader cannot read" in warnings[0]
+    assert "Falling back to tier 3" in warnings[1]
+    assert not any("tifffile reader" in w for w in warnings)
+    level1 = omero_world.base[::2, ::2]
+    assert np.array_equal(np.moveaxis(patch, 0, -1), level1[48:80, 48:80])
+    assert meta["tier"] == "network"
+
+
+@needs_monai
+def test_opening_a_local_slide_claims_libvips_for_this_process(
+    omero_world, monkeypatch
+):
+    """The probe runs libvips, so a later fork must fail fast, not hang."""
+    monkeypatch.setattr(datalist_module, "_VIPS_PID", None)
+
+    wsi = _reader(omero_world).read("omero://1962")
+
+    assert wsi.tier == "local"
+    assert datalist_module._VIPS_PID == os.getpid()
+
+
 @needs_monai
 def test_jpeg2000_sources_go_over_the_network_unless_forced(
     omero_world, tmp_path, caplog

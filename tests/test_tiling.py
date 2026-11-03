@@ -12,6 +12,7 @@ skipped rather than failed when omero-py isn't installed.
 from __future__ import annotations
 
 import csv
+import dataclasses
 import io
 import json
 import os
@@ -2278,6 +2279,522 @@ def test_tile_selection_is_pinned_for_a_fixed_slide_and_seed(mocked_slide, tmp_p
     ]
 
 
+# The pixels, manifest and tile metadata of the reader as it was before
+# --tier existed (see _output_digest and the test below). Re-derived from
+# the original PNG-bytes pin (5bf18038...), which the current reader still
+# matched on the machine it was recorded on; equal on Ubuntu CI.
+_PINNED_OUTPUT_SHA256 = (
+    "06088c656f787b5f7ff779085bdd2f042d9b7e761ea63f9972b7997e4300559c"
+)
+
+
+_REAL_SIZE = 16
+
+
+def _wire_real_slide(monkeypatch, source):
+    """Fake OMERO around a real 256 px pyramid file at *source*.
+
+    The tier is "local" with *source* as the original; the thumbnail, the
+    ROI (one G3 square) and the network tier's level list are fixed, so
+    only the pixel reader varies between tests. The network tier itself is
+    left alone -- a test that wants it fakes it.
+    """
+    import lavlab.roi as roi_module
+
+    analysis_ds = tiling.analysis_downsample(_REAL_SIZE)
+    thumb = np.full((256 // analysis_ds, 256 // analysis_ds, 3), 250, np.uint8)
+    thumb[8:-8, 8:-8] = (180, 60, 160)
+
+    monkeypatch.setattr(
+        tiling, "choose_tier", lambda c, i, force_local=False: ("local", str(source))
+    )
+    monkeypatch.setattr(tiling, "_load_thumbnail_local", lambda p, d: thumb)
+    monkeypatch.setattr(tiling, "_load_thumbnail_network", lambda c, i, d: thumb)
+    monkeypatch.setattr(
+        tiling, "network_level_dims", lambda c, i: [(256, 256), (128, 128)]
+    )
+    ring = _square_ring(
+        32 // analysis_ds, 32 // analysis_ds, 160 // analysis_ds, 160 // analysis_ds
+    )
+    monkeypatch.setattr(
+        roi_module, "get_shapes_as_points", lambda image, **kw: [_shape(7, ring, "g3")]
+    )
+    monkeypatch.setattr(roi_module, "shape_roi_ids", lambda image: {7: 70})
+
+
+def _real_params():
+    return _analysis_params(
+        scales=[1.0, 2.0],
+        size=_REAL_SIZE,
+        max_tiles_per_label=5,
+        max_background_tiles=4,
+        seed=11,
+    )
+
+
+def _output_digest(out):
+    """SHA-256 of what a slide's tiling produced, independent of the platform.
+
+    Covers the manifest's bytes and, per tile in manifest order, its path,
+    its *decoded* pixels and the metadata embedded in it. Not the files'
+    bytes: libvips versions encode identical pixels into different PNG
+    streams (8.15 on Ubuntu CI vs 8.18 from Homebrew), so a byte pin only
+    holds on one machine. The embedded ``lavlab_version`` is dropped, or
+    every release would break the pin.
+    """
+    import hashlib
+
+    slide_dir = out / "N101" / "N101_S08_HE"
+    digest = hashlib.sha256((slide_dir / tiling.MANIFEST_NAME).read_bytes())
+    for row in tiling.read_manifest(str(slide_dir)):
+        image = pyvips.Image.new_from_file(str(out / row["tile_path"]))
+        pixels = np.ascontiguousarray(image.numpy())
+        metadata = json.loads(image.get("png-comment-0-lavlab"))
+        metadata.pop("lavlab_version")
+        digest.update(row["tile_path"].encode())
+        digest.update(repr((pixels.shape, str(pixels.dtype))).encode())
+        digest.update(pixels.tobytes())
+        digest.update(json.dumps(metadata, sort_keys=True).encode())
+    return digest.hexdigest()
+
+
+@needs_omero
+def test_tile_output_is_byte_identical_for_a_fixed_slide_and_seed(
+    monkeypatch, tmp_path
+):
+    """Every byte ``lavlab tile`` writes for a fixed slide, settings and seed.
+
+    Real pixels from a real two-level pyramid through the default (auto)
+    tier, so a change to how the local reader is chosen or probed cannot
+    alter the tiles of a slide that already worked. Covers ROI labels, seeded
+    background sampling and two ``--scales`` (one per pyramid level).
+    """
+    source = tmp_path / "slide.tiff"
+    _write_pyramid(source, _synthetic_slide(256))
+    _wire_real_slide(monkeypatch, source)
+
+    out = tmp_path / "out"
+    result = tiling.tile_slide(None, _FakeImage(size=256), _real_params(), str(out))
+
+    rows = tiling.read_manifest(str(out / "N101" / "N101_S08_HE"))
+    assert result.tier == "local"
+    assert result.written == len(rows) == 18  # 9 centres x 2 scales
+    assert _output_digest(out) == _PINNED_OUTPUT_SHA256
+
+
+# --- --tier, and the local readers' fall-forward ---------------------------
+
+
+def _write_planar_pyramid(path, base, planarconfig):
+    """A tiled two-level RGB pyramid with the given plane layout.
+
+    ``"separate"`` is the layout part of the OMERO archive uses, which
+    libvips opens and then refuses to read ("tiled separate planes not
+    supported") -- reproduced here by construction, not mocked.
+    """
+    levels = [base, base[::2, ::2]]
+    if planarconfig == "separate":
+        levels = [np.ascontiguousarray(np.moveaxis(a, -1, 0)) for a in levels]
+    options = dict(tile=(64, 64), photometric="rgb", planarconfig=planarconfig)
+    with tifffile.TiffWriter(str(path), bigtiff=True) as writer:
+        writer.write(levels[0], **options)
+        writer.write(levels[1], subfiletype=1, **options)
+
+
+def _needs_tifffile_extra():
+    pytest.importorskip("zarr", reason="the [tifffile] extra (zarr) not installed")
+    pytest.importorskip("imagecodecs")
+
+
+def _hide_tifffile_extra(monkeypatch):
+    """Make the [tifffile] extra unimportable, as if never installed.
+
+    tifffile itself stays: the local tier already needs it for the pyramid
+    levels and thumbnail.
+    """
+    for name in ("zarr", "imagecodecs"):
+        monkeypatch.setitem(sys.modules, name, None)
+
+
+class _RecordingNetworkReader(_FakeTileReader):
+    """Stands in for tier 3 and records that it was used."""
+
+    opened = 0
+
+    def __init__(self, *args, **kwargs):
+        type(self).opened += 1
+
+
+@pytest.fixture
+def fake_network(monkeypatch):
+    _RecordingNetworkReader.opened = 0
+    monkeypatch.setattr(tiling, "NetworkRegionReader", _RecordingNetworkReader)
+    return _RecordingNetworkReader
+
+
+def test_libvips_opens_a_separate_plane_tiff_and_fails_on_the_first_read(tmp_path):
+    """Why the probe reads pixels: opening the file is not enough."""
+    path = tmp_path / "separate.tiff"
+    _write_planar_pyramid(path, _synthetic_slide(), "separate")
+    plan = select_level([256, 128], width0=256, ds_total=1.0, size=32)
+
+    reader = tiling.LocalRegionReader(str(path), plan, (256, 256))  # opens fine
+    try:
+        with pytest.raises(pyvips.Error, match="separate planes"):
+            reader.read(0, 0, 32, 32)
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("planarconfig, axes", [("contig", "YXS"), ("separate", "SYX")])
+def test_tifffile_reader_returns_height_width_bands_for_either_plane_order(
+    tmp_path, planarconfig, axes
+):
+    """A plane-order slip would silently scramble every tile; pin the pixels.
+
+    Offsets differ in x and y and the data is random per band, so a swapped
+    Y/X or a misplaced band axis cannot match by accident.
+    """
+    _needs_tifffile_extra()
+    base = _synthetic_slide()
+    path = tmp_path / f"{planarconfig}.tiff"
+    _write_planar_pyramid(path, base, planarconfig)
+    with tifffile.TiffFile(str(path)) as tif:
+        assert tif.series[0].axes == axes
+
+    level0 = select_level([256, 128], width0=256, ds_total=1.0, size=32)
+    level1 = select_level([256, 128], width0=256, ds_total=2.0, size=32)
+    assert (level0.index, level1.index) == (0, 1)
+    for plan, level_wh, expected in (
+        (level0, (256, 256), base[32:64, 96:128]),
+        (level1, (128, 128), base[::2, ::2][16:48, 48:80]),
+    ):
+        reader = tiling.TifffileRegionReader(str(path), plan, level_wh)
+        try:
+            region = reader.read(96, 32, 32, 32)
+        finally:
+            reader.close()
+        assert region.shape == (32, 32, 3)
+        assert region.dtype == np.uint8
+        assert np.array_equal(region, expected)
+
+
+def test_tifffile_reader_decodes_jpeg_tiles_of_a_separate_plane_file(tmp_path):
+    """The archive's separate-plane files are JPEG-tiled: the imagecodecs path."""
+    _needs_tifffile_extra()
+    base = np.ascontiguousarray(np.moveaxis(_synthetic_slide(), -1, 0))
+    path = tmp_path / "separate-jpeg.tiff"
+    tifffile.imwrite(
+        str(path),
+        base,
+        tile=(64, 64),
+        photometric="rgb",
+        planarconfig="separate",
+        compression="jpeg",
+    )
+    with tifffile.TiffFile(str(path)) as tif:
+        decoded = np.moveaxis(tif.series[0].asarray(), 0, -1)
+    plan = select_level([256], width0=256, ds_total=1.0, size=48)
+
+    reader = tiling.TifffileRegionReader(str(path), plan, (256, 256))
+    try:
+        region = reader.read(100, 40, 48, 48)
+    finally:
+        reader.close()
+
+    assert np.array_equal(region, decoded[40:88, 100:148])
+
+
+def test_tifffile_reader_matches_pyvips_on_a_contiguous_file(tmp_path):
+    _needs_tifffile_extra()
+    path = tmp_path / "slide.tiff"
+    _write_pyramid(path, _synthetic_slide())
+    plan = select_level([256, 128], width0=256, ds_total=2.0, size=32)
+
+    readers = [
+        tiling.LocalRegionReader(str(path), plan, (128, 128)),
+        tiling.TifffileRegionReader(str(path), plan, (128, 128)),
+    ]
+    try:
+        # (250, 250) runs off the level and is clamped the same way by both
+        for x0, y0 in ((0, 0), (64, 130), (250, 250)):
+            vips, tiff = (reader.read(x0, y0, 64, 64) for reader in readers)
+            assert np.array_equal(vips, tiff)
+    finally:
+        for reader in readers:
+            reader.close()
+
+
+def test_tifffile_reader_names_the_extra_when_it_is_missing(tmp_path, monkeypatch):
+    path = tmp_path / "slide.tiff"
+    _write_pyramid(path, _synthetic_slide())
+    _hide_tifffile_extra(monkeypatch)
+    plan = select_level([256, 128], width0=256, ds_total=1.0, size=32)
+
+    with pytest.raises(ImportError, match=r"lavlab-cli-utils\[tifffile\]"):
+        tiling.TifffileRegionReader(str(path), plan, (256, 256))
+
+
+@needs_omero
+def test_auto_falls_forward_to_tifffile_when_libvips_cannot_read(
+    monkeypatch, tmp_path, caplog, fake_network
+):
+    """A separate-plane slide tiles locally, to the same bytes as a contig one.
+
+    Same pixels, settings and seed as the pinned test, stored plane-first:
+    libvips fails the probe, tifffile serves the slide, and every tile and
+    the manifest come out identical to the pinned contiguous-plane run.
+    """
+    _needs_tifffile_extra()
+    source = tmp_path / "slide.tiff"
+    _write_planar_pyramid(source, _synthetic_slide(256), "separate")
+    _wire_real_slide(monkeypatch, source)
+
+    out = tmp_path / "out"
+    with caplog.at_level("INFO", logger="lavlab.tiling"):
+        result = tiling.tile_slide(None, _FakeImage(size=256), _real_params(), str(out))
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "pyvips reader cannot read" in warnings[0]
+    assert "separate planes" in warnings[0]
+    assert result.tier == "local"
+    assert fake_network.opened == 0
+    assert _output_digest(out) == _PINNED_OUTPUT_SHA256
+
+
+@needs_omero
+def test_auto_reaches_the_network_when_the_tifffile_extra_is_missing(
+    monkeypatch, tmp_path, caplog, fake_network
+):
+    source = tmp_path / "slide.tiff"
+    _write_planar_pyramid(source, _synthetic_slide(256), "separate")
+    _wire_real_slide(monkeypatch, source)
+    _hide_tifffile_extra(monkeypatch)
+
+    out = tmp_path / "out"
+    with caplog.at_level("DEBUG", logger="lavlab.tiling"):
+        result = tiling.tile_slide(None, _FakeImage(size=256), _real_params(), str(out))
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    # libvips failing, then the fall-forward; the missing extra is no warning
+    assert len(warnings) == 2
+    assert "pyvips reader cannot read" in warnings[0]
+    assert "Falling back to tier 3" in warnings[1]
+    assert not any("tifffile reader" in message for message in warnings)
+    assert result.tier == "network"
+    assert result.written == 18
+    assert fake_network.opened == 2  # one per scale
+    rows = tiling.read_manifest(str(out / "N101" / "N101_S08_HE"))
+    assert {row["tier"] for row in rows} == {"network"}
+
+
+@needs_omero
+def test_auto_reaches_the_network_when_no_local_reader_can_read(
+    monkeypatch, tmp_path, caplog, fake_network
+):
+    _needs_tifffile_extra()
+    source = tmp_path / "slide.tiff"
+    _write_planar_pyramid(source, _synthetic_slide(256), "separate")
+    _wire_real_slide(monkeypatch, source)
+
+    def broken(self, *args, **kwargs):
+        raise tiling.UnreadableSourceError("damaged")
+
+    monkeypatch.setattr(tiling.TifffileRegionReader, "__init__", broken)
+
+    with caplog.at_level("WARNING", logger="lavlab.tiling"):
+        result = tiling.tile_slide(
+            None, _FakeImage(size=256), _real_params(), str(tmp_path / "out")
+        )
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert "pyvips reader cannot read" in warnings[0]
+    assert "tifffile reader cannot read" in warnings[1]
+    assert "Falling back to tier 3" in warnings[2]
+    assert result.tier == "network"
+    assert fake_network.opened == 2
+
+
+@needs_omero
+def test_tier_network_never_reads_locally_even_with_a_readable_source(
+    monkeypatch, tmp_path, fake_network
+):
+    source = tmp_path / "slide.tiff"
+    _write_pyramid(source, _synthetic_slide(256))
+    _wire_real_slide(monkeypatch, source)
+
+    def local_read(*args, **kwargs):
+        raise AssertionError("--tier network touched the local source")
+
+    for name in ("choose_tier", "local_level_dims", "_load_thumbnail_local"):
+        monkeypatch.setattr(tiling, name, local_read)
+    monkeypatch.setattr(tiling, "LocalRegionReader", local_read)
+    monkeypatch.setattr(tiling, "TifffileRegionReader", local_read)
+
+    out = tmp_path / "out"
+    result = tiling.tile_slide(
+        None, _FakeImage(size=256), _real_params(), str(out), tier="network"
+    )
+
+    assert result.tier == "network"
+    assert fake_network.opened == 2
+    slide_dir = out / "N101" / "N101_S08_HE"
+    rows = tiling.read_manifest(str(slide_dir))
+    assert len(rows) == 18
+    assert {row["tier"] for row in rows} == {"network"}
+    assert read_tile_params(str(slide_dir))["tier"] == "network"
+
+
+@needs_omero
+def test_tier_local_reads_a_separate_plane_slide_through_tifffile(
+    monkeypatch, tmp_path, fake_network
+):
+    _needs_tifffile_extra()
+    source = tmp_path / "slide.tiff"
+    _write_planar_pyramid(source, _synthetic_slide(256), "separate")
+    _wire_real_slide(monkeypatch, source)
+
+    out = tmp_path / "out"
+    result = tiling.tile_slide(
+        None, _FakeImage(size=256), _real_params(), str(out), tier="local"
+    )
+
+    assert result.tier == "local"
+    assert fake_network.opened == 0
+    assert _output_digest(out) == _PINNED_OUTPUT_SHA256
+
+
+@needs_omero
+def test_tier_local_raises_instead_of_falling_back(monkeypatch, tmp_path, fake_network):
+    source = tmp_path / "slide.tiff"
+    source.write_bytes(b"not a tiff")
+    _wire_real_slide(monkeypatch, source)
+
+    with pytest.raises(TilingError, match="--tier local"):
+        tiling.tile_slide(
+            None, _FakeImage(size=256), _real_params(), str(tmp_path), tier="local"
+        )
+    assert fake_network.opened == 0
+
+
+@needs_omero
+def test_tier_local_raises_when_the_source_is_not_mounted(
+    monkeypatch, tmp_path, fake_network
+):
+    _wire_real_slide(monkeypatch, tmp_path / "unused.tiff")
+    monkeypatch.setattr(
+        tiling,
+        "choose_tier",
+        lambda c, i, force_local=False: ("network", "/OMERO/nope.ome.tiff"),
+    )
+
+    with pytest.raises(TilingError, match="not readable here"):
+        tiling.select_tiles(None, _FakeImage(size=256), _real_params(), tier="local")
+    assert fake_network.opened == 0
+
+
+@needs_omero
+def test_tier_local_names_the_extra_when_only_tifffile_could_read(
+    monkeypatch, tmp_path, fake_network
+):
+    source = tmp_path / "slide.tiff"
+    _write_planar_pyramid(source, _synthetic_slide(256), "separate")
+    _wire_real_slide(monkeypatch, source)
+    _hide_tifffile_extra(monkeypatch)
+
+    with pytest.raises(
+        ImportError, match=r"pip install 'lavlab-cli-utils\[tifffile\]'"
+    ):
+        tiling.select_tiles(None, _FakeImage(size=256), _real_params(), tier="local")
+    assert fake_network.opened == 0
+
+
+@needs_omero
+def test_tier_local_reads_a_jp2_source_locally(
+    monkeypatch, tmp_path, caplog, fake_network
+):
+    """--tier local implies --force-local: no JPEG-2000 detour to the network."""
+    import lavlab.omero_client as omero_client
+
+    choose_tier = tiling.choose_tier
+    source = tmp_path / "slide.jp2"
+    source.write_bytes(b"not really a jp2")
+    _wire_real_slide(monkeypatch, source)
+    monkeypatch.setattr(tiling, "choose_tier", choose_tier)
+    monkeypatch.setattr(omero_client, "get_source_file_path", lambda c, i: str(source))
+
+    with caplog.at_level("WARNING"), pytest.raises(TilingError, match="cannot be read"):
+        tiling.select_tiles(None, _FakeImage(size=256), _real_params(), tier="local")
+
+    # it went for the file (and found it unreadable) instead of the network
+    assert not any("JPEG-2000" in r.getMessage() for r in caplog.records)
+    assert fake_network.opened == 0
+
+
+def test_select_tiles_rejects_an_unknown_tier():
+    with pytest.raises(ValueError, match="tier must be one of"):
+        tiling.select_tiles(None, _FakeImage(size=256), _real_params(), tier="disk")
+
+
+def test_tier_flag_accepts_auto_local_and_network():
+    from lavlab.commands import tile as tile_command
+
+    assert _tile_args("--whole").tier == "auto"
+    for tier in ("auto", "local", "network"):
+        assert _tile_args("--whole", "--tier", tier).tier == tier
+    with pytest.raises(SystemExit):
+        _tile_args("--whole", "--tier", "disk")
+    # the CLI spells the choices out to keep --help free of numpy
+    assert tile_command.TIERS == tiling.TIERS
+
+
+def test_tier_flag_reaches_tile_slide(monkeypatch):
+    from lavlab.commands import tile as tile_command
+
+    seen = {}
+    monkeypatch.setattr(tiling, "tile_slide", lambda *a, **kw: seen.update(kw))
+    args = _tile_args("--whole", "--tier", "network")
+
+    tile_command._tile_one(None, None, args, _build_params(args))
+
+    assert seen["tier"] == "network"
+    assert seen["force_local"] is False
+
+
+def test_tile_help_and_import_lavlab_do_not_import_the_tifffile_extra():
+    program = textwrap.dedent(
+        """
+        import sys
+
+        import lavlab
+        import lavlab.tiling
+        from lavlab.cli import main
+
+        try:
+            main(["tile", "--help"])
+        except SystemExit:
+            pass
+        loaded = sorted(
+            m for m in ("tifffile", "imagecodecs", "zarr") if m in sys.modules
+        )
+        print("LOADED", loaded)
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"
+        ),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--tier {auto,local,network}" in completed.stdout
+    assert completed.stdout.strip().splitlines()[-1] == "LOADED []"
+
+
 # --- the binary bundles what the tissue mask reaches at runtime ------------
 
 
@@ -2313,3 +2830,217 @@ def test_scipy_computed_imports_are_named_for_nuitka():
     assert computed <= flagged, f"not named for Nuitka: {sorted(computed - flagged)}"
     for module in flagged:
         importlib.import_module(module)
+
+
+# --- the label map is loaded once and carried in TileParams ----------------
+
+
+def test_the_loaded_label_map_is_not_part_of_the_signature(tmp_path):
+    labels = tmp_path / "labels.yaml"
+    labels.write_text("Cancer: [g3]\n")
+    plain = _analysis_params(labels=str(labels))
+    loaded = dataclasses.replace(plain, label_map=load_label_map(str(labels)))
+
+    assert loaded.label_map == {"Cancer": ["g3"]}
+    assert loaded.signature() == plain.signature()
+    assert "label_map" not in plain.signature()
+    assert loaded == plain
+    write_params(str(tmp_path), loaded)
+    assert params_match(read_tile_params(str(tmp_path)), plain)
+
+
+@needs_omero
+def test_tile_slide_labels_from_the_loaded_map_without_rereading_the_file(
+    mocked_slide, tmp_path
+):
+    """The file is gone (a dropped mount); the in-memory copy still labels."""
+    labels = tmp_path / "labels.yaml"
+    labels.write_text("Cancer: [g3]\n")
+    params = _analysis_params(labels=str(labels), coords_only=True)
+    params = dataclasses.replace(params, label_map=load_label_map(str(labels)))
+    labels.unlink()
+
+    result = tiling.tile_slide(None, _FakeImage(), params, str(tmp_path / "out"))
+
+    assert result.status == "done"
+    assert result.label_counts["Cancer"] > 0
+
+
+# --- --manifest where flock does not work ----------------------------------
+
+
+def _flock_raising(errors):
+    """A flock that raises each of *errors* in turn, then succeeds."""
+    import fcntl
+
+    real = fcntl.flock
+    pending = list(errors)
+
+    def flock(fh, operation):
+        if operation == fcntl.LOCK_EX and pending:
+            raise pending.pop(0)
+        return real(fh, operation)
+
+    return flock
+
+
+def test_append_manifest_retries_a_lock_that_smb_says_is_busy(
+    tmp_path, monkeypatch, caplog
+):
+    import errno
+    import fcntl
+
+    busy = BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+    monkeypatch.setattr(fcntl, "flock", _flock_raising([busy, busy]))
+    monkeypatch.setattr(tiling.time, "sleep", lambda s: None)
+    manifest = tmp_path / "dataset.csv"
+
+    with caplog.at_level("WARNING"):
+        added = tiling.append_manifest(str(manifest), _manifest_rows(3), str(tmp_path))
+
+    assert added == 3
+    assert caplog.records == []  # got the lock on the third try
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        BlockingIOError(35, "Resource temporarily unavailable"),
+        OSError(__import__("errno").ENOTSUP, "Operation not supported"),
+    ],
+)
+def test_append_manifest_carries_on_unlocked_when_it_cannot_lock(
+    tmp_path, monkeypatch, caplog, error
+):
+    import fcntl
+
+    monkeypatch.setattr(fcntl, "flock", _flock_raising([error] * 50))
+    monkeypatch.setattr(tiling.time, "sleep", lambda s: None)
+    manifest = tmp_path / "dataset.csv"
+
+    with caplog.at_level("WARNING"):
+        added = tiling.append_manifest(str(manifest), _manifest_rows(3), str(tmp_path))
+
+    assert added == 3
+    with open(manifest, newline="") as fh:
+        assert len(list(csv.DictReader(fh))) == 3
+    (warning,) = caplog.records
+    assert "Could not lock --manifest" in warning.getMessage()
+
+
+def _shard(manifest, worker, rows, tmp_path):
+    shard = tiling.manifest_shard_path(str(manifest), "run", worker)
+    tiling.append_manifest(shard, rows, str(tmp_path), lock=False)
+    return shard
+
+
+def _read_rejected(path):
+    with open(path, newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def test_merge_manifest_shards_counts_every_row_it_does_not_append(tmp_path, caplog):
+    manifest = tmp_path / "dataset.csv"
+    tiling.append_manifest(str(manifest), _manifest_rows(2), str(tmp_path))
+    conflicting = _manifest_rows(2)[1:]
+    conflicting[0]["label"] = "G5"  # same tile as the manifest's t1, new label
+    shards = [
+        # t0 identical to the manifest's, t2 new
+        _shard(manifest, 11, _manifest_rows(3)[::2], tmp_path),
+        _shard(manifest, 12, conflicting + _manifest_rows(2, prefix="b/t"), tmp_path),
+    ]
+    with open(shards[1], "a", newline="") as fh:
+        fh.write("b/t9.png,1,,,,G3,,,,,,,,,,,,,,EXTRA\r\n")  # one field too many
+        fh.write("b/t8.png,1,,,,G3,,,,,,,,,,,,,netw")  # cut inside the last field
+
+    assert tiling.list_manifest_shards(str(manifest), "run") == shards
+    assert tiling.list_manifest_shards(str(manifest), "other-run") == []
+    with caplog.at_level("WARNING"):
+        merge = tiling.merge_manifest_shards(str(manifest), shards, run_id="run")
+
+    assert (merge.appended, merge.identical, merge.conflicting, merge.malformed) == (
+        3,
+        1,
+        1,
+        2,
+    )
+    with open(manifest, newline="") as fh:
+        kept = {row["tile_path"]: row["label"] for row in csv.DictReader(fh)}
+    assert kept == {
+        "N101/N101_S08_HE/G3/t0.png": "G3",
+        "N101/N101_S08_HE/G3/t1.png": "G3",  # the existing row wins the conflict
+        "N101/N101_S08_HE/G3/t2.png": "G3",
+        "b/t0.png": "G3",
+        "b/t1.png": "G3",
+    }
+    # every row not appended, except the identical one, is recorded verbatim
+    rejected = _read_rejected(merge.rejected_path)
+    assert [(r["shard"], r["line"], r["reason"].split(":")[0]) for r in rejected] == [
+        (shards[1], "5", "malformed"),
+        (shards[1], "6", "incomplete"),
+        (shards[1], "2", "conflicts with the existing row for the same tile"),
+    ]
+    assert rejected[1]["raw"].endswith(",netw")
+    assert ",G5," in rejected[2]["raw"]
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(f"'{shards[1]}' line 5 -- malformed: 20 fields" in m for m in messages)
+    assert any(f"'{shards[1]}' line 6 -- incomplete" in m for m in messages)
+    assert any(
+        "3 of 6 shard row(s) not appended" not in m
+        and "4 of 7 shard row(s) not appended -- 1 identical" in m
+        for m in messages
+    )
+    assert not any(os.path.exists(shard) for shard in shards)
+
+
+def test_a_legitimate_row_is_never_mistaken_for_a_cut_off_one(tmp_path):
+    """Detection is structural -- field count and the line terminator -- so
+    awkward but valid values (quotes, commas, embedded newlines, a form feed,
+    an empty last column) all pass."""
+    manifest = tmp_path / "dataset.csv"
+    awkward = _manifest_rows(5)
+    awkward[0]["label"] = 'He said "G3", twice'
+    awkward[1]["label"] = "two\nlines"
+    awkward[2]["label"] = "form\x0cfeed\u2028sep"
+    awkward[3]["tier"] = ""  # empty final field
+    awkward[4]["tile_path"] = "with,comma.png"
+    shard = _shard(manifest, 11, awkward, tmp_path)
+
+    merge = tiling.merge_manifest_shards(str(manifest), [shard], run_id="run")
+
+    assert (merge.appended, merge.malformed, merge.rejected_path) == (5, 0, None)
+    with open(manifest, newline="") as fh:
+        labels = [row["label"] for row in csv.DictReader(fh)]
+    assert labels[:3] == ['He said "G3", twice', "two\nlines", "form\x0cfeed\u2028sep"]
+
+
+def test_append_refuses_a_manifest_that_ends_mid_row(tmp_path):
+    """Appending after a cut-off write would glue the new row onto it."""
+    manifest = tmp_path / "dataset.csv"
+    tiling.append_manifest(str(manifest), _manifest_rows(1), str(tmp_path))
+    with open(manifest, "a") as fh:
+        fh.write("N101/N101_S08_HE/G3/t7.png,1,,,,G3")
+    before = manifest.read_bytes()
+
+    with pytest.raises(TilingError, match="line 3 is incomplete"):
+        tiling.append_manifest(
+            str(manifest), _manifest_rows(2, prefix="b/t"), str(tmp_path)
+        )
+
+    assert manifest.read_bytes() == before
+
+
+def test_append_manifest_warns_about_rows_it_skips(tmp_path, caplog):
+    manifest = tmp_path / "dataset.csv"
+    tiling.append_manifest(str(manifest), _manifest_rows(2), str(tmp_path))
+    again = _manifest_rows(2)
+    again[1]["label"] = "G5"
+
+    with caplog.at_level("WARNING"):
+        added = tiling.append_manifest(str(manifest), again, str(tmp_path))
+
+    assert added == 0
+    messages = [r.getMessage() for r in caplog.records]
+    assert "1 identical to rows already there" in messages[0]
+    assert "1 CONFLICTING" in messages[0]
+    assert ",G5," in messages[1]

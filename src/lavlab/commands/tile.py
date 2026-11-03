@@ -8,9 +8,11 @@ from __future__ import annotations
 import argparse
 import logging
 import multiprocessing
+import os
 import random
 import time
 from collections import Counter
+from datetime import UTC, datetime
 
 from lavlab.commands._shared import (
     BATCH_TARGET_HELP,
@@ -36,6 +38,9 @@ DEFAULT_MAX_BACKGROUND_TILES = 2000
 DEFAULT_EXCLUDE_TEXT = ("exclusion roi",)
 DEFAULT_JPEG_QUALITY = 90
 DEFAULT_CONNECTIONS = 4
+# lavlab.tiling.TIERS, spelled out here: importing lavlab.tiling pulls in
+# numpy, which --help must not need (see lavlab/cli.py).
+TIERS = ("auto", "local", "network")
 
 DESCRIPTION = f"""\
 Cut whole-slide images from OMERO into fixed-size image tiles, for training
@@ -392,6 +397,16 @@ def add_parser(subparsers) -> None:
         "default these are fetched over the network instead, because reading "
         "them locally decodes the whole file for every tile.",
     )
+    running.add_argument(
+        "--tier",
+        choices=TIERS,
+        default="auto",
+        help="Where pixels come from. 'auto' (default) reads the original file "
+        "when OMERO's repository is mounted here and a test read of it "
+        "succeeds, and otherwise uses the OMERO tile API. 'network' always "
+        "uses the tile API. 'local' always reads the file, and fails the slide "
+        "instead of falling back.",
+    )
     parser.set_defaults(handler=run)
 
 
@@ -616,14 +631,42 @@ def _explain_erosion(params) -> None:
         )
 
 
+def _load_label_map(params):
+    """Read the run's label map once, or exit before any slide is touched.
+
+    Every slide labels from this one in-memory copy (it travels to the batch
+    workers inside *params*), so the file is never read again: if ``--labels``
+    sits on a network mount that drops mid-run, the run is unaffected rather
+    than failing each remaining slide with the same "does not exist".
+    """
+    from dataclasses import replace
+
+    import yaml
+
+    from lavlab.tiling import TilingError, load_label_map
+
+    if params.mode != "roi":
+        return params
+    try:
+        label_map = load_label_map(params.labels)
+    except (TilingError, OSError, yaml.YAMLError) as exc:
+        detail = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
+        raise SystemExit(
+            f"error: cannot read the label map --labels '{params.labels}' "
+            f"({type(exc).__name__}: {detail}). Nothing was tiled."
+        ) from None
+    return replace(params, label_map=label_map)
+
+
 def run(args: argparse.Namespace) -> None:
     _validate_args(args)
-    _explain_erosion(_build_params(args))
+    params = _load_label_map(_build_params(args))
+    _explain_erosion(params)
     target = parse_target(args.target)
     if isinstance(target, int):
-        _run_single(args, target)
+        _run_single(args, target, params)
     else:
-        _run_batch(args)
+        _run_batch(args, params)
 
 
 def _tile_one(conn, image, args: argparse.Namespace, params):
@@ -640,6 +683,8 @@ def _tile_one(conn, image, args: argparse.Namespace, params):
         manifest_path=args.manifest,
         dry_run=args.dry_run,
         store_count=args.connections,
+        tier=args.tier,
+        manifest_lock=not getattr(args, "manifest_is_shard", False),
     )
 
 
@@ -715,10 +760,11 @@ def _print_report(result, params) -> None:
         print("  Dropped -- " + "; ".join(drops))
 
 
-def _run_single(args: argparse.Namespace, image_id: int) -> None:
-    from lavlab.tiling import TilingError
+def _run_single(args: argparse.Namespace, image_id: int, params=None) -> None:
+    from lavlab.tiling import TifffileUnavailableError, TilingError
 
-    params = _build_params(args)
+    if params is None:
+        params = _load_label_map(_build_params(args))
     conn = connect_from_args(args)
     try:
         image = conn.getObject("Image", image_id)
@@ -728,7 +774,9 @@ def _run_single(args: argparse.Namespace, image_id: int) -> None:
 
         try:
             result = _tile_one(conn, image, args, params)
-        except TilingError as exc:
+        except (TilingError, TifffileUnavailableError) as exc:
+            # TifffileUnavailableError: --tier local on a source only the
+            # tifffile reader could read; its message is the install command.
             raise SystemExit(f"error: image {image_id}: {exc}") from None
         except Exception as exc:
             from lavlab.omero_client import describe_error, is_resource_error
@@ -785,15 +833,34 @@ def _close_quietly(conn) -> None:
         log.debug("closing a dead connection failed", exc_info=True)
 
 
-def _init_worker(args: argparse.Namespace, params) -> None:
+def _init_worker(
+    args: argparse.Namespace, params, manifest_run: str | None = None
+) -> None:
     """Pool initializer. Must never raise.
 
     A ``multiprocessing.Pool`` whose initializer raises silently respawns the
     worker, which runs the initializer again -- forever. With logins failing
     that is a reconnect storm with no end, so a failed first login is logged
     and left for the worker's first slide to retry.
+
+    With ``--manifest``, the worker appends to its own shard of it
+    (:func:`lavlab.tiling.manifest_shard_path`), never to the shared file:
+    workers locking one file is what fails on SMB. *manifest_run* names the
+    run, so :func:`_run_batch` merges exactly this run's shards.
     """
     global _WORKER_STATE
+    if args.manifest and manifest_run:
+        from lavlab.tiling import manifest_shard_path
+
+        args = argparse.Namespace(
+            **{
+                **vars(args),
+                "manifest": manifest_shard_path(
+                    args.manifest, manifest_run, os.getpid()
+                ),
+                "manifest_is_shard": True,
+            }
+        )
     _WORKER_STATE = {"conn": None, "args": args, "params": params}
     time.sleep(random.uniform(0, min(_MAX_STARTUP_STAGGER, 0.5 * args.workers)))
     try:
@@ -830,32 +897,53 @@ def _process_one(image_id: int):
     ends the whole batch, so every failure -- expected or not -- becomes a
     ``failed`` :class:`lavlab.tiling.SlideResult` here, and the batch moves
     on to the next slide.
+
+    Every failure is logged here, once, as ``Image <id>: failed -- <Type>:
+    <message>``, so ``grep ': failed -- '`` counts them all. Only one nobody
+    anticipated -- not a :class:`lavlab.tiling.TilingError`, a missing pixel
+    file or a lost connection -- also carries its traceback.
     """
     from lavlab.omero_client import describe_error
     from lavlab.tiling import SlideResult
 
     try:
-        return _tile_with_retries(image_id)
+        result = _tile_with_retries(image_id)
     except (Exception, SystemExit) as exc:
-        reason = describe_error(exc)
-        log.warning(
-            "Image %d: failed (%s); continuing with the next slide.",
-            image_id,
-            reason,
-            exc_info=True,
-        )
-        return SlideResult(image_id, "failed", reason=reason)
+        result = SlideResult(image_id, "failed", reason=describe_error(exc))
+        log.warning("Image %d: failed -- %s", image_id, result.reason, exc_info=True)
+        return result
+    if result.status == "failed":
+        log.warning("Image %d: failed -- %s", image_id, result.reason)
+    return result
+
+
+# Reconnect attempts per slide, and the base of their jittered exponential
+# backoff (see lavlab.omero_client.retry_delay).
+_MAX_ATTEMPTS = 3
+_RECONNECT_BASE_DELAY = 1.0
 
 
 def _tile_with_retries(image_id: int):
-    """Tile one slide, reconnecting only for genuine connection failures."""
-    from lavlab.omero_client import describe_error, is_conn_error, is_resource_error
-    from lavlab.tiling import SlideResult, TilingError
+    """Tile one slide, reconnecting only for genuine connection failures.
+
+    Returns a ``failed`` result for the failures that belong to this one
+    image -- a :class:`lavlab.tiling.TilingError`, or an
+    ``omero.ResourceError`` (its pixel file is missing or corrupt on the
+    server, which no reconnect changes) -- without retrying. A connection
+    failure is retried after a jittered, exponentially growing wait, so
+    workers that lost the server together do not all log back in at once.
+    """
+    from lavlab.omero_client import (
+        describe_error,
+        is_conn_error,
+        is_resource_error,
+        retry_delay,
+    )
+    from lavlab.tiling import SlideResult, TifffileUnavailableError, TilingError
 
     args = _WORKER_STATE["args"]
     params = _WORKER_STATE["params"]
-    max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
         conn = None
         try:
             # Inside the try: a login that fails here is handled below like
@@ -863,44 +951,42 @@ def _tile_with_retries(image_id: int):
             conn = _worker_conn(args)
             image = get_image(conn, image_id)
             if image is None:
-                log.warning("Image %d not found, skipping.", image_id)
-                return SlideResult(image_id, "failed", reason="not found")
+                return SlideResult(
+                    image_id, "failed", reason="NotFound: no such image in OMERO"
+                )
             group_of(conn, image)
             return _tile_one(conn, image, args, params)
-        except TilingError as exc:
-            log.warning("Image %d: %s", image_id, exc)
-            return SlideResult(image_id, "failed", reason=str(exc))
+        except (TilingError, TifffileUnavailableError) as exc:
+            return SlideResult(image_id, "failed", reason=describe_error(exc))
         except Exception as exc:
             if is_resource_error(exc):
-                reason = describe_error(exc)
+                return SlideResult(image_id, "failed", reason=describe_error(exc))
+            if is_conn_error(exc) and attempt < _MAX_ATTEMPTS:
+                delay = retry_delay(attempt, exc, _RECONNECT_BASE_DELAY)
                 log.warning(
-                    "Image %d: OMERO could not read this image's pixels -- its file "
-                    "is likely missing or corrupt on the server. Skipping it; the "
-                    "connection is fine, so no reconnect. Server said: %s",
+                    "Image %d: connection error, reconnecting in %.1f s "
+                    "(attempt %d/%d): %s",
                     image_id,
-                    reason,
-                )
-                return SlideResult(image_id, "failed", reason=reason)
-            if is_conn_error(exc) and attempt < max_attempts:
-                log.warning(
-                    "Image %d: connection error, reconnecting (attempt %d/%d): %s",
-                    image_id,
+                    delay,
                     attempt,
-                    max_attempts,
+                    _MAX_ATTEMPTS,
                     describe_error(exc),
                 )
                 _close_quietly(conn)
                 _WORKER_STATE["conn"] = None
+                time.sleep(delay)
                 continue
             raise
-    return SlideResult(image_id, "failed", reason="retries exhausted")
+    return SlideResult(image_id, "failed", reason="RetriesExhausted")
 
 
 def _format_ids(results, status: str) -> str:
     return ", ".join(str(r.image_id) for r in results if r.status == status)
 
 
-def _summarise_batch(image_ids, results) -> None:
+def _summarise_batch(
+    image_ids, results, *, failures_path=None, manifest_merge=None
+) -> None:
     """Report what the batch achieved, and fail the run if it achieved nothing.
 
     Split out from ``_run_batch`` so the reporting and exit-code rules can be
@@ -910,6 +996,10 @@ def _summarise_batch(image_ids, results) -> None:
     per-label totals matter as much as the per-slide ones: a run that
     "succeeded" on every slide while producing no G5 tiles at all is a
     broken run, and only the label line shows it.
+
+    *failures_path* is this run's ``failures-<UTC>.csv``, and
+    *manifest_merge* the :class:`lavlab.tiling.ManifestMerge` of its
+    ``--manifest`` shards, if any.
     """
     by_status = Counter(r.status for r in results)
     done = by_status.get("done", 0)
@@ -928,6 +1018,8 @@ def _summarise_batch(image_ids, results) -> None:
         unannotated,
         failed,
     )
+    failure_reasons = _log_failure_reasons(results, failures_path)
+    _log_manifest_merge(manifest_merge)
 
     tiers = Counter(r.tier for r in results if r.status == "done" and r.tier)
     if tiers:
@@ -985,19 +1077,108 @@ def _summarise_batch(image_ids, results) -> None:
             log.info("%s image IDs: %s", heading, ids)
 
     if image_ids and failed == len(image_ids):
+        reason, count = failure_reasons.most_common(1)[0]
         raise SystemExit(
-            f"error: all {len(image_ids)} images failed; see the per-image errors above."
+            f"error: all {len(image_ids)} images failed; the most common reason "
+            f"({count}x) was: {reason}. Every failure is "
+            + (f"in {failures_path} and " if failures_path else "")
+            + "logged as 'Image <id>: failed -- ...' above."
         )
 
 
-def _run_batch(args: argparse.Namespace) -> None:
-    from lavlab.omero_client import iter_image_ids
+# Distinct failure reasons listed in the batch summary before "... and N more".
+_TOP_FAILURE_REASONS = 5
 
-    params = _build_params(args)
+_FAILURE_HINTS = {
+    "ResourceError": "OMERO could not open these images' pixel files -- missing "
+    "or corrupt on the server. Not retried: reconnecting cannot fix them.",
+}
+
+
+def _failure_type(reason: str | None) -> str:
+    """The exception type a failure reason (``"Type: message"``) starts with."""
+    if not reason:
+        return "unknown"
+    head, sep, _rest = reason.partition(":")
+    return head if sep and head and " " not in head else reason
+
+
+def _log_manifest_merge(merge) -> None:
+    """One summary line for the ``--manifest`` merge: what went in, what didn't."""
+    if merge is None:
+        return
+    level = logging.WARNING if merge.not_appended else logging.INFO
+    log.log(
+        level,
+        "Manifest: %d row(s) appended from %d worker shard(s); %d not appended "
+        "(%d identical to existing rows, %d conflicting, %d malformed)%s",
+        merge.appended,
+        merge.shards,
+        merge.not_appended,
+        merge.identical,
+        merge.conflicting,
+        merge.malformed,
+        f"; see {merge.rejected_path}" if merge.rejected_path else "",
+    )
+
+
+def _log_failure_reasons(results, failures_path=None) -> Counter:
+    """Break the batch's failures down by exception type and by reason.
+
+    One cause failing many slides -- a label map on a dropped mount, a server
+    out of disk -- shows up as one line with a big count, next to the total.
+
+    :return: failures per distinct reason
+    """
+    reasons = Counter(r.reason or "unknown" for r in results if r.status == "failed")
+    if not reasons:
+        return reasons
+    types: Counter = Counter()
+    for reason, count in reasons.items():
+        types[_failure_type(reason)] += count
+    log.info(
+        "Failed by type: %s",
+        ", ".join(f"{name}={count}" for name, count in types.most_common()),
+    )
+    for reason, count in reasons.most_common(_TOP_FAILURE_REASONS):
+        log.info("  %5d x %s", count, reason)
+    if len(reasons) > _TOP_FAILURE_REASONS:
+        log.info(
+            "  ... and %d other reasons%s.",
+            len(reasons) - _TOP_FAILURE_REASONS,
+            f" (see {failures_path})" if failures_path else "",
+        )
+    for name, hint in _FAILURE_HINTS.items():
+        if name in types:
+            log.info("  %s: %s", name, hint)
+    return reasons
+
+
+def _run_batch(args: argparse.Namespace, params=None) -> None:
+    from lavlab.omero_client import iter_image_ids
+    from lavlab.tiling import TilingError, check_manifest_columns
+
+    if params is None:
+        params = _load_label_map(_build_params(args))
+    # Names this run's failures file and its --manifest shards and rejects,
+    # so nothing one run writes is overwritten by the next (--skip-existing
+    # resumes are the normal workflow, and their history is the evidence).
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    log.info("Batch run %s.", stamp)
+    manifest_run = None
+    if args.manifest:
+        # Checked up front: with workers writing shards, the shared file is
+        # only touched once every slide is done.
+        try:
+            check_manifest_columns(args.manifest)
+        except TilingError as exc:
+            raise SystemExit(f"error: {exc}") from None
+        manifest_run = f"{stamp}-{random.getrandbits(32):08x}"
+
     log.info("Starting %d workers.", args.workers)
     ctx = multiprocessing.get_context("fork")
     with ctx.Pool(
-        args.workers, initializer=_init_worker, initargs=(args, params)
+        args.workers, initializer=_init_worker, initargs=(args, params, manifest_run)
     ) as pool:
         conn = connect_from_args(args)
         try:
@@ -1014,20 +1195,102 @@ def _run_batch(args: argparse.Namespace) -> None:
         ]
         results = [_collect(image_id, task) for image_id, task in pending]
 
-    _summarise_batch(image_ids, results)
+    failures_path = None if args.dry_run else _write_failures(args.out, results, stamp)
+    merge, merge_error = _merge_manifest_shards(args.manifest, manifest_run)
+    _summarise_batch(
+        image_ids, results, failures_path=failures_path, manifest_merge=merge
+    )
+    if merge_error:
+        raise SystemExit(merge_error)
 
 
 def _collect(image_id: int, task):
     """Wait for one image's result; a failure counts that image as failed."""
+    from lavlab.omero_client import describe_error
     from lavlab.tiling import SlideResult
 
     try:
         return task.get()
     except Exception as exc:
+        reason = describe_error(exc)
         log.warning(
-            "Image %d: worker failed (%s: %s); counting it as failed.",
+            "Image %d: failed -- %s (the worker's result never came back)",
             image_id,
+            reason,
+        )
+        return SlideResult(image_id, "failed", reason=reason)
+
+
+def failures_path_for(out_dir: str, stamp: str, attempt: int = 1) -> str:
+    """``<out>/failures-<UTC stamp>.csv``, ``-2``, ``-3``... if that is taken."""
+    suffix = "" if attempt == 1 else f"-{attempt}"
+    return os.path.join(out_dir, f"failures-{stamp}{suffix}.csv")
+
+
+def _write_failures(out_dir: str, results, stamp: str) -> str:
+    """Write this run's ``failures-<UTC stamp>.csv`` (``image_id,reason``).
+
+    One file per batch, created exclusively and never overwritten, so a
+    series of ``--skip-existing`` resumes keeps every run's failures -- the
+    record that tells a systematic problem from a transient one. Written
+    (header only) even when nothing failed: that a run was clean is part of
+    the record too.
+
+    :return: the file's path
+    """
+    import csv
+
+    os.makedirs(out_dir, exist_ok=True)
+    rows = [
+        [result.image_id, result.reason or ""]
+        for result in results
+        if result.status == "failed"
+    ]
+    attempt = 1
+    while True:
+        path = failures_path_for(out_dir, stamp, attempt)
+        try:
+            fh = open(path, "x", newline="")
+        except FileExistsError:
+            attempt += 1
+            continue
+        break
+    with fh:
+        writer = csv.writer(fh)
+        writer.writerow(["image_id", "reason"])
+        writer.writerows(rows)
+        fh.flush()
+        os.fsync(fh.fileno())
+    log.info("%d failed slide(s) and their reasons written to %s", len(rows), path)
+    return path
+
+
+def _merge_manifest_shards(manifest: str | None, run: str | None):
+    """Fold the workers' manifest shards into ``--manifest``.
+
+    :return: ``(ManifestMerge or None, error message for the exit or None)``
+    """
+    if not manifest or not run:
+        return None, None
+    from lavlab.tiling import list_manifest_shards, merge_manifest_shards
+
+    shards = list_manifest_shards(manifest, run)
+    if not shards:
+        return None, None
+    try:
+        merge = merge_manifest_shards(manifest, shards, run_id=run)
+    except Exception as exc:
+        log.error(
+            "Could not merge the workers' manifest shards into '%s' (%s: %s). "
+            "Every tile is on disk and in its slide's own manifest.csv; the "
+            "shards are kept: %s",
+            manifest,
             type(exc).__name__,
             exc,
+            ", ".join(shards),
         )
-        return SlideResult(image_id, "failed", reason=type(exc).__name__)
+        return None, (
+            f"error: --manifest '{manifest}' was not updated ({type(exc).__name__}: "
+            f"{exc}); rerun with --skip-existing to rebuild it."
+        )
+    return merge, None

@@ -417,7 +417,13 @@ the OMERO ROI the tile came from; `x`/`y` are the tile's level-0 *centre*
 tier) record how each tile was chosen -- see
 [`docs/reference.md`](docs/reference.md) for all of them. `--manifest`
 writes the same columns, with `tile_path` relative to the CSV's own
-folder so the index and tiles can be moved together.
+folder so the index and tiles can be moved together. It works on SMB and
+other network shares: batch workers each write a private shard, merged
+into the manifest at the end, instead of all locking one file. The merge
+never drops a row silently: duplicates and malformed rows are counted in a
+`WARNING` and the summary, and every row not appended (other than exact
+duplicates) is kept, with its shard and line, in
+`<manifest>.rejected-<run>.csv`.
 
 **Every tile describes itself**, too: the image ID, ROI ID, label, centre
 and mpp are embedded in the file (a PNG text chunk, or JPEG EXIF), so a
@@ -452,6 +458,42 @@ The tier used is logged per slide and recorded in every manifest row. A
 local source that won't decode falls forward to the network tier with a
 `WARNING`, exactly as `lr` does.
 
+**A mounted file is not proof it can be read.** Part of the archive (the
+`importer_2` imports, about half of it) is tiled OME-TIFF that stores each
+colour plane separately (`planarconfig` SEPARATE). libvips opens these and
+reads their pyramid without complaint, then fails on the first pixel read
+with `tiff2vips: tiled separate planes not supported`. So before a slide
+commits to the local tier, `tile` reads one real region at every pyramid
+level it will use, and falls forward in this order:
+
+1. **pyvips** -- the default local reader, fast on contiguous-plane files.
+2. **tifffile** -- reads both plane layouts; used only where pyvips fails.
+   It needs an optional extra (`tifffile`, `imagecodecs`, `zarr`), which the
+   compiled binary does not include:
+
+   ```sh
+   pip install 'lavlab-cli-utils[tifffile]'
+   ```
+
+   Without the extra this step is skipped silently.
+3. **OMERO's tile API.**
+
+Each reader that fails logs a one-line `WARNING`; the slide then reports
+`tier local` (pyvips or tifffile) or `tier network`. Run with the default
+from the binary, the separate-plane half of the archive comes over the
+network: correct, just slower.
+
+**`--tier {auto,local,network}`** overrides the choice:
+
+| `--tier` | Behaviour |
+|---|---|
+| `auto` (default) | As above: probe the local file, fall forward to the network |
+| `network` | Always the OMERO tile API, even with the repository mounted and readable |
+| `local` | Always the local file (pyvips, then tifffile). Never falls back: a slide that cannot be read locally fails, naming the extra if only tifffile could have read it. Also reads JPEG-2000 originals locally, as `--force-local` does |
+
+`--tier network` is the escape hatch if the probe ever chooses wrong;
+`--tier local` checks that the fast path really works on a set of slides.
+
 **JPEG-2000 sources** are a special case of that fall-forward: the bundled
 libvips has no jp2k loader, so random reads would go through Pillow, which
 decodes the entire codestream *per crop*. A bare `.jp2` source therefore
@@ -465,11 +507,16 @@ same tiles and the same pyramid level either way. What they cannot
 guarantee is bit-identical *pixels*: tier 2 reads the source file's own
 pyramid and tier 3 reads OMERO's, and for lossily-compressed levels those
 can differ by a quantization step. Don't mix tiers within one training set
-if that matters to you.
+if that matters to you. The two local readers decode the *same* file, and
+matched pixel for pixel in testing (both use libjpeg-turbo), but they are
+different decoder builds, so that is not guaranteed either.
 
 **Class folders** come from a `{folder: [textValue aliases]}` YAML
 (`src/lavlab/data/default_tile_labels.yaml`, overridable with `--labels`),
-matched case-insensitively and trimmed. The default maps the palette's
+matched case-insensitively and trimmed. It is read once, before the run
+connects to OMERO -- an unreadable file stops the run immediately, and one
+that vanishes mid-run (a dropped mount) cannot fail the slides still to
+come. The default maps the palette's
 `G4CG`/`G4FG` spellings onto the `G4cg`/`G4fg` folders the classifier
 expects, and lists the non-Gleason palette labels (`Atrophy`, `HGPIN`,
 `Seminal_Vesicles`, `Vessel`, `Urethra`) so `--all` doesn't warn about
@@ -480,8 +527,15 @@ Batch mode matches `lr batch`/`roi batch`: per-slide failures warn and
 continue, and the run ends with per-tier, per-label, ROI/erosion and
 done/skipped/unannotated/failed totals, with the image IDs for each. Any
 error on one slide -- including one nobody anticipated -- marks that slide
-failed and the batch carries on; only a slide whose *connection* dropped is
-retried, after logging in again. Workers stagger their first login, and if
+failed and the batch carries on. Each failure is logged once as
+`Image <id>: failed -- <Type>: <message>` and written to
+`<out>/failures-<UTC start time>.csv` (`image_id,reason`) -- a new file
+per run, so resumes keep the earlier runs' failures -- and the summary
+breaks the
+failures down by reason. An `omero.ResourceError` (a missing or corrupt
+pixel file on the server) fails just that image, with no reconnect and no
+retry; only a slide whose *connection* dropped is retried, after logging in
+again with a jittered, growing delay. Workers stagger their first login, and if
 OMERO's session service starts refusing logins (an Ice
 `ProtocolException`), retries back off longer and at random intervals
 instead of hammering it.

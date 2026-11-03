@@ -91,6 +91,12 @@ monai = [
   "omero-py",
 ]
 
+# The tifffile local reader `lavlab tile` falls forward to when libvips cannot
+# read a mounted original (tiled separate-plane TIFFs). Python-only: zarr is
+# kept out of the Nuitka binary (see build_native.py), so there the reader is
+# skipped and those slides come over the network instead.
+tifffile = ["tifffile", "imagecodecs", "zarr"]
+
 [project.scripts]
 lavlab = "lavlab.launcher:main"
 
@@ -140,6 +146,9 @@ dependencies = [
   "pyvips",
   "tifffile",
   "imagecodecs",
+  # the [tifffile] extra's third package; without it the tifffile reader's
+  # tests skip
+  "zarr",
   "scikit-image",
   "PyYAML",
   "tqdm",

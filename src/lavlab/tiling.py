@@ -16,6 +16,13 @@ Pixels come from one of two tiers, mirroring ``lavlab.large_recon``:
   pyramid.
 * **network** -- otherwise, regions are fetched through OMERO's tile API.
 
+A mounted file is not proof that it can be read: libvips opens a tiled TIFF
+that stores each colour plane separately, and fails only on the first pixel
+read. So the local tier is settled by cutting one real region (see
+:func:`probe_local_reader`) with pyvips, then with tifffile if the optional
+``tifffile`` extra is installed, before falling forward to the network.
+``--tier`` (:data:`TIERS`) pins either tier instead.
+
 Everything expensive is decided at *analysis resolution*: one coarse
 thumbnail per slide (~8 samples across a tile) carries the tissue mask and
 the rasterised ROIs, and integral images turn "what fraction of this tile
@@ -34,6 +41,8 @@ numpy installed.
 from __future__ import annotations
 
 import csv
+import errno
+import io
 import json
 import logging
 import math
@@ -41,6 +50,7 @@ import os
 import random
 import re
 import tempfile
+import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field, replace
@@ -79,7 +89,28 @@ class UnreadableSourceError(TilingError):
     """
 
 
+class TifffileUnavailableError(ImportError):
+    """Raised when the optional ``tifffile`` reader extra is not installed.
+
+    An :class:`ImportError`, so it is one of :func:`_local_source_errors`;
+    separate so ``--tier auto`` can skip the tifffile reader without a
+    warning -- a missing optional dependency is not a fault -- while
+    ``--tier local`` reports it with the install command.
+    """
+
+
 SUBSAMPLES_PER_TILE = 8
+
+# --tier: "auto" probes the local source and falls forward to the network;
+# "local" and "network" pin one tier and never fall back.
+TIERS = ("auto", "local", "network")
+
+# Local readers in the order --tier auto tries them. pyvips stays first: it
+# is a hard dependency and fast on contiguous-plane TIFFs, and tifffile is
+# only reached for files libvips cannot read.
+LOCAL_READERS = ("pyvips", "tifffile")
+
+TIFFFILE_EXTRA = "lavlab-cli-utils[tifffile]"
 
 DEFAULT_EXCLUDE_TEXT = ("exclusion roi",)
 
@@ -1159,6 +1190,134 @@ class LocalRegionReader:
         self._image = None
 
 
+def _import_tifffile_reader():
+    """Import the optional ``tifffile`` extra, or say how to install it.
+
+    :return: the ``(tifffile, zarr)`` modules
+    :raises TifffileUnavailableError: if any of the extra is missing
+    """
+    try:
+        # tifffile hands JPEG tile decoding to imagecodecs and only fails on
+        # the first tile without it, so check for it up front.
+        import imagecodecs  # noqa: F401
+        import tifffile
+        import zarr
+    except ImportError as exc:
+        raise TifffileUnavailableError(
+            f"the tifffile local reader needs the optional '{TIFFFILE_EXTRA}' "
+            f"extra ({exc}); install it with: pip install '{TIFFFILE_EXTRA}'"
+        ) from exc
+    return tifffile, zarr
+
+
+class TifffileRegionReader:
+    """Tier 2 through tifffile, for sources libvips cannot read.
+
+    libvips refuses tiled TIFFs that store each colour plane separately
+    (``planarconfig`` SEPARATE). tifffile reads both layouts, but returns
+    them in different axis orders -- ``YXS`` for contiguous planes, ``SYX``
+    for separate ones -- so the order is taken from the series' own axes
+    and every region comes back ``(h, w, bands)``, exactly what
+    :class:`LocalRegionReader` returns for the same region.
+
+    Needs the optional ``tifffile`` extra (:data:`TIFFFILE_EXTRA`), which is
+    imported here and nowhere else.
+    """
+
+    def __init__(self, src_path: str, plan: LevelPlan, level_wh: tuple[int, int]):
+        """
+        :param src_path: the source file
+        :type src_path: str
+        :param plan: the level and region size to read
+        :type plan: LevelPlan
+        :param level_wh: that level's ``(width, height)``
+        :type level_wh: tuple[int, int]
+        :raises TifffileUnavailableError: if the extra is not installed
+        :raises UnreadableSourceError: if the level is not a uint8 Y/X image
+            of the expected size
+        """
+        tifffile, zarr = _import_tifffile_reader()
+        self._plan = plan
+        self._level_wh = level_wh
+        self._tif = tifffile.TiffFile(src_path)
+        try:
+            series = self._tif.series[0]
+            axes = series.levels[plan.index].axes
+            if "Y" not in axes or "X" not in axes:
+                raise UnreadableSourceError(
+                    f"TIFF series in '{src_path}' has axes '{axes}' with no Y/X."
+                )
+            self._array = zarr.open(series.aszarr(level=plan.index), mode="r")
+            if self._array.dtype != np.uint8:
+                raise UnreadableSourceError(
+                    f"'{src_path}' level {plan.index} is {self._array.dtype}; "
+                    "local tiling only supports uint8."
+                )
+            shape = self._array.shape
+            found = (shape[axes.index("X")], shape[axes.index("Y")])
+            if found != tuple(level_wh):
+                raise UnreadableSourceError(
+                    f"level {plan.index} of '{src_path}' is {found[0]}x{found[1]}, "
+                    f"expected {level_wh[0]}x{level_wh[1]}."
+                )
+        except BaseException:
+            self._tif.close()
+            raise
+        # Planes are "S" (samples, RGB) or "C" (OME channels); any other
+        # axis tifffile kept is a singleton Z/T and is indexed away.
+        self._bands_axis = "S" if "S" in axes else ("C" if "C" in axes else None)
+        self._axes = axes
+
+    def prefetch(self, regions: Sequence[tuple[int, int, int, int]]) -> None:
+        """No-op: a mounted file needs no batching."""
+
+    def read(self, x0: int, y0: int, w0: int, h0: int) -> np.ndarray:
+        """Read one level-0 region, returned at the chosen pyramid level.
+
+        :param x0: level-0 left edge
+        :type x0: int
+        :param y0: level-0 top edge
+        :type y0: int
+        :param w0: level-0 width
+        :type w0: int
+        :param h0: level-0 height
+        :type h0: int
+        :return: an ``(read_size, read_size, bands)`` uint8 array
+        :rtype: numpy.ndarray
+        """
+        size = self._plan.read_size
+        level_w, level_h = self._level_wh
+        x = min(max(int(round(x0 / self._plan.downsample)), 0), max(level_w - size, 0))
+        y = min(max(int(round(y0 / self._plan.downsample)), 0), max(level_h - size, 0))
+        width = min(size, level_w - x)
+        height = min(size, level_h - y)
+
+        index: list[slice | int] = []
+        for axis in self._axes:
+            if axis == "Y":
+                index.append(slice(y, y + height))
+            elif axis == "X":
+                index.append(slice(x, x + width))
+            elif axis == self._bands_axis:
+                index.append(slice(None))
+            else:
+                index.append(0)
+        region = np.asarray(self._array[tuple(index)])
+
+        kept = [a for a in self._axes if a in ("Y", "X", self._bands_axis)]
+        if self._bands_axis is None:
+            region = region[..., np.newaxis]
+            kept.append("bands")
+        else:
+            kept = ["bands" if a == self._bands_axis else a for a in kept]
+        order = [kept.index(a) for a in ("Y", "X", "bands")]
+        return np.ascontiguousarray(region.transpose(order))
+
+    def close(self) -> None:
+        self._array = None
+        self._tif.close()
+
+
 class NetworkRegionReader:
     """Tier 3: fetch regions through OMERO's tile API.
 
@@ -1576,6 +1735,13 @@ class TileParams:
     # --erode: None = half a tile (the default), 0 = off, else micrometres.
     erode_um: float | None = None
     quality: int | None = None
+    # *labels*, already loaded (load_label_map). Read once at start-up and
+    # carried into the workers, so a file that becomes unreachable mid-run
+    # cannot fail the remaining slides one at a time. Not a setting -- the
+    # path in *labels* is -- so it is left out of signature() and ==.
+    label_map: dict[str, list[str]] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def output_mpps(self) -> list[float | None]:
         """Every scale this run writes, finest (the labelling scale) first.
@@ -1594,6 +1760,7 @@ class TileParams:
         :rtype: dict
         """
         data = asdict(self)
+        del data["label_map"]
         data["text_filter"] = sorted(str(t).lower() for t in self.text_filter)
         data["exclude_text"] = sorted(str(t).lower() for t in self.exclude_text)
         return data
@@ -1734,7 +1901,255 @@ def _manifest_key(row: dict) -> tuple:
     )
 
 
-def append_manifest(manifest_path: str, rows: Sequence[dict], out_root: str) -> int:
+def check_manifest_columns(manifest_path: str) -> None:
+    """Fail fast if an existing combined manifest has other columns.
+
+    :param manifest_path: the ``--manifest`` file; absent is fine
+    :type manifest_path: str
+    :raises TilingError: if the file exists with a different header
+    """
+    if not os.path.isfile(manifest_path):
+        return
+    with open(manifest_path, newline="") as fh:
+        header = next(csv.reader(fh), None)
+    if header is not None and tuple(header) != MANIFEST_COLUMNS:
+        raise TilingError(
+            f"--manifest '{manifest_path}' has different columns from this "
+            "lavlab version's; point --manifest at a new file."
+        )
+
+
+# flock errors that mean "this filesystem cannot lock", not "someone else
+# holds the lock": NFS without lockd, and SMB/CIFS mounts.
+_LOCK_UNSUPPORTED = {
+    errno.ENOLCK,
+    errno.EOPNOTSUPP,
+    errno.ENOTSUP,
+    errno.EINVAL,
+    errno.ENOSYS,
+}
+_LOCK_ATTEMPTS = 6
+
+
+def _lock_manifest(fh, manifest_path: str) -> bool:
+    """Take an exclusive ``flock`` on *fh*, or report that none can be had.
+
+    A blocking ``flock`` should wait, but on SMB it returns ``EAGAIN``
+    (``BlockingIOError``) while another process holds the lock, so that is
+    retried with jittered exponential backoff. A filesystem that cannot lock
+    at all is not retried. Either way the caller goes on unlocked, with a
+    WARNING, rather than aborting the run.
+
+    :return: whether the lock is held
+    :rtype: bool
+    """
+    import fcntl
+
+    reason: OSError | None = None
+    for attempt in range(_LOCK_ATTEMPTS):
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            return True
+        except BlockingIOError as exc:
+            reason = exc
+            time.sleep(random.uniform(0.5, 1.0) * 0.05 * 2**attempt)
+        except OSError as exc:
+            if exc.errno not in _LOCK_UNSUPPORTED:
+                raise
+            reason = exc
+            break
+    log.warning(
+        "Could not lock --manifest '%s' (%s: %s); appending without a lock. "
+        "Don't point two lavlab runs at this manifest at the same time.",
+        manifest_path,
+        type(reason).__name__,
+        reason,
+    )
+    return False
+
+
+def _row_values(row: dict) -> tuple[str, ...]:
+    """A row's manifest cells as csv would write them, for comparing rows."""
+    return tuple(
+        "" if row.get(col) is None else str(row.get(col)) for col in MANIFEST_COLUMNS
+    )
+
+
+@dataclass
+class ManifestRecord:
+    """One record read back from a manifest or a shard, with where it was."""
+
+    path: str
+    line: int
+    fields: list[str]
+    raw: str
+
+
+def _read_manifest_records(
+    path: str,
+) -> tuple[list[str] | None, list[ManifestRecord], list[tuple[ManifestRecord, str]]]:
+    """Parse a manifest-format CSV strictly: ``(header, good, malformed)``.
+
+    A record is accepted only if it has exactly as many fields as the
+    header, and -- for the file's last record -- only if the file ends in a
+    line terminator. That second test is what catches a write cut off
+    *inside* the last field (``network`` -> ``netw``), which leaves the
+    field count intact; :func:`_append_rows` refuses to append to a file
+    whose last line is unterminated, so the last record is the only place
+    a cut-off write can be. Nothing is inferred from the values.
+
+    :param path: the CSV
+    :type path: str
+    :return: the header (None for an empty file), the well-formed records,
+        and each malformed one with why
+    """
+    with open(path, "rb") as fh:
+        data = fh.read()
+    terminated = not data or data.endswith(b"\n")
+    # Split into physical lines exactly as csv reads them (newline="": on
+    # \r, \n or \r\n only), so line numbers and raw text match csv's.
+    stream = io.StringIO(data.decode("utf-8", errors="replace"), newline="")
+    lines = stream.readlines()
+    stream.seek(0)
+
+    reader = csv.reader(stream)
+    header = next(reader, None)
+    good: list[ManifestRecord] = []
+    bad: list[tuple[ManifestRecord, str]] = []
+    if header is None:
+        return None, good, bad
+    if not terminated and reader.line_num == len(lines):
+        # Nothing but a header, and it was cut off.
+        bad.append(
+            (ManifestRecord(path, 1, header, lines[0]), "incomplete: header cut off")
+        )
+        return header, good, bad
+    records = []
+    previous = reader.line_num
+    for fields in reader:
+        records.append(
+            ManifestRecord(
+                path,
+                previous + 1,
+                fields,
+                "".join(lines[previous : reader.line_num]),
+            )
+        )
+        previous = reader.line_num
+    for index, record in enumerate(records):
+        if index == len(records) - 1 and not terminated:
+            bad.append((record, "incomplete: the file ends mid-row (write cut off)"))
+        elif len(record.fields) != len(header):
+            why = (
+                f"malformed: {len(record.fields)} fields, the header has {len(header)}"
+            )
+            bad.append((record, why))
+        else:
+            good.append(record)
+    return header, good, bad
+
+
+@dataclass
+class ManifestAppend:
+    """What one append did with the rows it was given."""
+
+    appended: int = 0
+    # Same key as a row already present, and the same content: nothing lost.
+    identical: list[dict] = field(default_factory=list)
+    # Same key, different content: the existing row was kept, this one not.
+    conflicting: list[dict] = field(default_factory=list)
+
+
+def _append_rows(
+    manifest_path: str, rows: Sequence[dict], *, lock: bool
+) -> ManifestAppend:
+    """Append *rows* to *manifest_path*, sorting out the ones already in it.
+
+    Refuses a file that is not clean to append to -- other columns, a
+    malformed row, or a last line without its terminator (a write cut off
+    earlier): appending to that would glue a new row onto a broken one.
+    """
+    import fcntl
+
+    outcome = ManifestAppend()
+    with open(manifest_path, "a+", newline="") as fh:
+        locked = _lock_manifest(fh, manifest_path) if lock else False
+        try:
+            header, existing, malformed = _read_manifest_records(manifest_path)
+            if header is not None and tuple(header) != MANIFEST_COLUMNS:
+                raise TilingError(
+                    f"--manifest '{manifest_path}' has different columns from this "
+                    "lavlab version's; point --manifest at a new file."
+                )
+            if malformed:
+                record, why = malformed[0]
+                raise TilingError(
+                    f"'{manifest_path}' line {record.line} is {why}; refusing to "
+                    f"append to it ({len(malformed)} bad row(s) in all). Repair or "
+                    "remove those lines, then rerun."
+                )
+            seen = {
+                _manifest_key(
+                    dict(zip(MANIFEST_COLUMNS, r.fields, strict=True))
+                ): tuple(r.fields)
+                for r in existing
+            }
+            fresh = []
+            for row in rows:
+                key = _manifest_key(row)
+                values = _row_values(row)
+                if key not in seen:
+                    seen[key] = values
+                    fresh.append(row)
+                elif seen[key] == values:
+                    outcome.identical.append(row)
+                else:
+                    outcome.conflicting.append(row)
+
+            fh.seek(0, os.SEEK_END)
+            writer = csv.DictWriter(
+                fh, fieldnames=list(MANIFEST_COLUMNS), extrasaction="ignore"
+            )
+            if header is None:
+                writer.writeheader()
+            writer.writerows(fresh)
+            fh.flush()
+            os.fsync(fh.fileno())
+            outcome.appended = len(fresh)
+        finally:
+            if locked:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+    return outcome
+
+
+# Conflicting rows listed one by one in the log; the rest are counted.
+_LISTED_CONFLICTS = 10
+
+
+def _warn_skipped_rows(manifest_path: str, outcome: ManifestAppend) -> None:
+    """Never skip a manifest row silently: say how many, and which conflict."""
+    if not outcome.identical and not outcome.conflicting:
+        return
+    log.warning(
+        "--manifest '%s': %d row(s) not appended -- %d identical to rows already "
+        "there (expected when resuming), %d CONFLICTING with an existing row for "
+        "the same tile (the existing row was kept).",
+        manifest_path,
+        len(outcome.identical) + len(outcome.conflicting),
+        len(outcome.identical),
+        len(outcome.conflicting),
+    )
+    for row in outcome.conflicting[:_LISTED_CONFLICTS]:
+        log.warning("  conflicting row not appended: %s", ",".join(_row_values(row)))
+
+
+def append_manifest(
+    manifest_path: str,
+    rows: Sequence[dict],
+    out_root: str,
+    *,
+    lock: bool = True,
+) -> int:
     """Append one slide's rows to a combined, cross-run manifest.
 
     ``--manifest`` accumulates every slide of every run pointed at it into
@@ -1743,22 +2158,27 @@ def append_manifest(manifest_path: str, rows: Sequence[dict], out_root: str) -> 
     is rewritten relative to the manifest's own directory, so the manifest
     and the tiles can be moved together.
 
-    Safe for concurrent batch workers (an exclusive ``flock`` around the
-    read-and-append), and idempotent: rows already present -- from a resumed
-    or repeated run -- are not written twice.
+    Idempotent: rows already present -- from a resumed or repeated run --
+    are not written twice; a skipped row is never silent (a WARNING with the
+    count, listing any whose content differs from the row kept). The file
+    must be clean to append to (:func:`_append_rows`). Concurrent writers are serialised with an
+    exclusive ``flock`` where the filesystem supports one (see
+    :func:`_lock_manifest`); batch workers do not share the file at all, but
+    each append to their own shard (:func:`manifest_shard_path`), merged at
+    the end with :func:`merge_manifest_shards`.
 
-    :param manifest_path: the combined manifest
+    :param manifest_path: the combined manifest, or a worker's shard of it
     :type manifest_path: str
     :param rows: the slide's rows, ``tile_path`` relative to *out_root*
     :type rows: Sequence[dict]
     :param out_root: the ``-o`` directory those paths are relative to
     :type out_root: str
+    :param lock: take a file lock first; a shard has one writer and needs none
+    :type lock: bool
     :return: the number of rows actually appended
     :rtype: int
     :raises TilingError: if the file exists with different columns
     """
-    import fcntl
-
     manifest_path = os.path.abspath(manifest_path)
     manifest_dir = os.path.dirname(manifest_path)
     os.makedirs(manifest_dir, exist_ok=True)
@@ -1770,33 +2190,172 @@ def append_manifest(manifest_path: str, rows: Sequence[dict], out_root: str) -> 
             absolute = os.path.join(os.path.abspath(out_root), row["tile_path"])
             row["tile_path"] = os.path.relpath(absolute, manifest_dir)
         rebased.append(row)
+    outcome = _append_rows(manifest_path, rebased, lock=lock)
+    _warn_skipped_rows(manifest_path, outcome)
+    return outcome.appended
 
-    with open(manifest_path, "a+", newline="") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            fh.seek(0)
-            reader = csv.DictReader(fh)
-            header = reader.fieldnames
-            if header is not None and tuple(header) != MANIFEST_COLUMNS:
-                raise TilingError(
-                    f"--manifest '{manifest_path}' has different columns from this "
-                    "lavlab version's; point --manifest at a new file."
-                )
-            seen = {_manifest_key(existing) for existing in reader}
-            fresh = [row for row in rebased if _manifest_key(row) not in seen]
 
-            fh.seek(0, os.SEEK_END)
-            writer = csv.DictWriter(
-                fh, fieldnames=list(MANIFEST_COLUMNS), extrasaction="ignore"
+def manifest_shard_path(manifest_path: str, run_id: str, worker: int) -> str:
+    """Return one batch worker's private shard of a combined manifest.
+
+    In the manifest's own directory, so its relative ``tile_path`` values
+    are already right for the manifest and merge verbatim.
+
+    :param manifest_path: the combined manifest
+    :type manifest_path: str
+    :param run_id: identifies this batch run, so it merges only its own
+    :type run_id: str
+    :param worker: the worker's PID
+    :type worker: int
+    :return: the shard's path
+    :rtype: str
+    """
+    manifest_path = os.path.abspath(manifest_path)
+    directory, name = os.path.split(manifest_path)
+    return os.path.join(directory, f".{name}.{run_id}.{worker}.part")
+
+
+def list_manifest_shards(manifest_path: str, run_id: str) -> list[str]:
+    """Return every shard one batch run wrote for *manifest_path*.
+
+    :param manifest_path: the combined manifest
+    :type manifest_path: str
+    :param run_id: the run, as passed to :func:`manifest_shard_path`
+    :type run_id: str
+    :return: shard paths, sorted
+    :rtype: list[str]
+    """
+    import glob
+
+    directory, name = os.path.split(os.path.abspath(manifest_path))
+    pattern = f".{glob.escape(name)}.{glob.escape(run_id)}.*.part"
+    return sorted(glob.glob(os.path.join(glob.escape(directory), pattern)))
+
+
+@dataclass
+class ManifestMerge:
+    """What :func:`merge_manifest_shards` did, for the log and the summary."""
+
+    shards: int = 0
+    appended: int = 0
+    identical: int = 0
+    conflicting: int = 0
+    malformed: int = 0
+    # Every row that was read but is not in the manifest verbatim, with why.
+    rejected_path: str | None = None
+
+    @property
+    def not_appended(self) -> int:
+        return self.identical + self.conflicting + self.malformed
+
+
+def rejected_rows_path(manifest_path: str, run_id: str) -> str:
+    """Where a merge records the rows it did not append, beside the manifest.
+
+    :param manifest_path: the combined manifest
+    :type manifest_path: str
+    :param run_id: the batch run
+    :type run_id: str
+    :return: ``<manifest stem>.rejected-<run_id>.csv``
+    :rtype: str
+    """
+    stem, _ext = os.path.splitext(os.path.abspath(manifest_path))
+    return f"{stem}.rejected-{run_id}.csv"
+
+
+def merge_manifest_shards(
+    manifest_path: str, shard_paths: Sequence[str], *, run_id: str = "merge"
+) -> ManifestMerge:
+    """Append every shard's rows to the combined manifest, then delete them.
+
+    No row is dropped silently. Each shard is parsed strictly
+    (:func:`_read_manifest_records`), and every row that does not end up in
+    the manifest verbatim -- malformed, cut off by a killed worker, or
+    conflicting with a row already there -- is logged at WARNING (malformed
+    ones with shard and line), counted in the returned
+    :class:`ManifestMerge`, and written with its shard, line, reason and raw
+    text to :func:`rejected_rows_path`. Only rows identical to one already
+    present are left out unrecorded, since nothing is lost; they are counted.
+    Shards are deleted only after the manifest and that record are on disk;
+    if either write fails, they are kept.
+
+    :param manifest_path: the combined manifest
+    :type manifest_path: str
+    :param shard_paths: from :func:`list_manifest_shards`
+    :type shard_paths: Sequence[str]
+    :param run_id: names the rejected-rows file
+    :type run_id: str
+    :return: the counts, and the rejected-rows file if one was written
+    :rtype: ManifestMerge
+    :raises TilingError: if the manifest is not clean to append to
+    """
+    manifest_path = os.path.abspath(manifest_path)
+    report = ManifestMerge(shards=len(shard_paths))
+    rows: list[dict] = []
+    sources: list[ManifestRecord] = []
+    rejected: list[tuple[ManifestRecord, str]] = []
+    for shard in shard_paths:
+        header, good, malformed = _read_manifest_records(shard)
+        if header is not None and tuple(header) != MANIFEST_COLUMNS:
+            rejected.extend(
+                (record, f"shard has other columns: {header}") for record in good
             )
-            if header is None:
-                writer.writeheader()
-            writer.writerows(fresh)
+            good = []
+        rejected.extend(malformed)
+        for record in good:
+            rows.append(dict(zip(MANIFEST_COLUMNS, record.fields, strict=True)))
+            sources.append(record)
+    # Everything rejected so far is malformed; conflicts are added below.
+    report.malformed = len(rejected)
+    for record, why in rejected:
+        log.warning(
+            "--manifest merge: dropped '%s' line %d -- %s: %s",
+            record.path,
+            record.line,
+            why,
+            record.raw.rstrip("\r\n"),
+        )
+
+    outcome = _append_rows(manifest_path, rows, lock=True) if rows else ManifestAppend()
+    report.appended = outcome.appended
+    report.identical = len(outcome.identical)
+    report.conflicting = len(outcome.conflicting)
+    by_row = {id(row): record for row, record in zip(rows, sources, strict=True)}
+    rejected.extend(
+        (by_row[id(row)], "conflicts with the existing row for the same tile")
+        for row in outcome.conflicting
+    )
+
+    if rejected:
+        report.rejected_path = rejected_rows_path(manifest_path, run_id)
+        with open(report.rejected_path, "a", newline="") as fh:
+            writer = csv.writer(fh)
+            if fh.tell() == 0:
+                writer.writerow(["shard", "line", "reason", "raw"])
+            for record, why in rejected:
+                writer.writerow(
+                    [record.path, record.line, why, record.raw.rstrip("\r\n")]
+                )
             fh.flush()
             os.fsync(fh.fileno())
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
-    return len(fresh)
+    if report.not_appended:
+        log.warning(
+            "--manifest '%s': %d of %d shard row(s) not appended -- %d identical to "
+            "rows already there, %d conflicting with an existing row, %d "
+            "malformed.%s",
+            manifest_path,
+            report.not_appended,
+            report.appended + report.not_appended,
+            report.identical,
+            report.conflicting,
+            report.malformed,
+            f" Every one but the identical rows is in {report.rejected_path}."
+            if report.rejected_path
+            else "",
+        )
+    for shard in shard_paths:
+        os.remove(shard)
+    return report
 
 
 @dataclass
@@ -1940,6 +2499,101 @@ def warn_local_fallback(
         exc,
         exc_info=exc,
     )
+
+
+def open_local_reader(
+    name: str, src_path: str, plan: LevelPlan, level_wh: tuple[int, int]
+) -> LocalRegionReader | TifffileRegionReader:
+    """Open one of :data:`LOCAL_READERS` on a pyramid level.
+
+    :param name: ``"pyvips"`` or ``"tifffile"``
+    :type name: str
+    :param src_path: the source file
+    :type src_path: str
+    :param plan: the level and region size to read
+    :type plan: LevelPlan
+    :param level_wh: that level's ``(width, height)``
+    :type level_wh: tuple[int, int]
+    :return: a region reader
+    """
+    if name == "tifffile":
+        return TifffileRegionReader(src_path, plan, level_wh)
+    if name == "pyvips":
+        return LocalRegionReader(src_path, plan, level_wh)
+    raise ValueError(f"unknown local reader {name!r}; expected one of {LOCAL_READERS}")
+
+
+def probe_local_reader(
+    image_id: int,
+    src_path: str,
+    plans: Sequence[LevelPlan],
+    level_dims: Sequence[tuple[int, int]],
+    region: tuple[int, int, int, int],
+    *,
+    required: bool = False,
+) -> str:
+    """Return the first local reader that can actually read this source.
+
+    Opening a file proves little: libvips opens a separate-plane tiled TIFF
+    and reads its pyramid without complaint, then fails on the first pixel
+    read. So each of :data:`LOCAL_READERS` in turn cuts *region* at every
+    pyramid level in *plans*, through the same ``read`` the tiles go
+    through, and the first to manage all of them serves the whole slide.
+
+    A reader that fails is logged at WARNING and the next is tried. A
+    tifffile reader that is not installed is skipped without one, unless
+    *required*, when its :class:`TifffileUnavailableError` is what is raised.
+
+    :param image_id: the OMERO image ID, for the log
+    :type image_id: int
+    :param src_path: the source file
+    :type src_path: str
+    :param plans: the level plans the run will read, one per output scale
+    :type plans: Sequence[LevelPlan]
+    :param level_dims: ``(width, height)`` per local pyramid level
+    :type level_dims: Sequence[tuple[int, int]]
+    :param region: a level-0 ``(x0, y0, w0, h0)`` region to read
+    :type region: tuple[int, int, int, int]
+    :param required: ``--tier local``: report a missing tifffile extra
+        rather than the pyvips failure that led to it
+    :type required: bool
+    :return: the name of the reader to use
+    :rtype: str
+    :raises Exception: one of :func:`_local_source_errors`, if no local
+        reader can serve this source
+    """
+    levels = {plan.index: plan for plan in plans}
+    failure: BaseException | None = None
+    for name in LOCAL_READERS:
+        try:
+            for index, plan in sorted(levels.items()):
+                reader = open_local_reader(name, src_path, plan, level_dims[index])
+                try:
+                    reader.read(*region)
+                finally:
+                    reader.close()
+        except TifffileUnavailableError as exc:
+            if required:
+                raise exc from failure
+            log.debug("Image %d: tifffile reader skipped -- %s", image_id, exc)
+            continue
+        except _local_source_errors() as exc:
+            log.warning(
+                "Image %d: the %s reader cannot read '%s' -- %s: %s",
+                image_id,
+                name,
+                src_path,
+                type(exc).__name__,
+                str(exc).strip().replace("\n", " "),
+            )
+            failure = exc
+            continue
+        if failure is not None:
+            log.info("Image %d: reading '%s' with %s.", image_id, src_path, name)
+        return name
+    if failure is None:  # pragma: no cover - LOCAL_READERS is never empty
+        raise UnreadableSourceError(f"no local reader for '{src_path}'.")
+    raise failure
 
 
 def network_level_dims(conn, image) -> list[tuple[int, int]]:
@@ -2087,7 +2741,10 @@ def analyze_slide(
         return records, stats, has_rois
 
     if lookup is None:
-        lookup = build_alias_lookup(load_label_map(params.labels))
+        label_map = params.label_map
+        if label_map is None:
+            label_map = load_label_map(params.labels)
+        lookup = build_alias_lookup(label_map)
 
     warned: set[str] = set()
 
@@ -2279,6 +2936,8 @@ class SlideSelection:
     tiles: list[GridTile]
     analysis_ds: int = 0
     tier: str | None = None
+    # With tier "local", which of LOCAL_READERS the probe settled on.
+    local_reader: str | None = None
     src_path: str | None = None
     level_dims: list[tuple[int, int]] = field(default_factory=list)
     # One per entry of scale_ds.
@@ -2343,14 +3002,19 @@ def select_tiles(
     params: TileParams,
     *,
     force_local: bool = False,
+    tier: str = "auto",
 ) -> SlideSelection:
-    """Decide every tile a slide yields, reading no full-resolution pixels.
+    """Decide every tile a slide yields, reading one full-resolution region.
 
     Resolves the output scales, lays the grid at the finest one, picks the
     pixel tier (local source or OMERO tile API, falling forward with a
     WARNING), loads the analysis thumbnail and ROIs, labels every grid cell
     with :func:`analyze_slide`, drops concentric crops that would run off the
     slide, and applies the seeded caps with :func:`sample_records`.
+
+    The one region read is the local tier's probe
+    (:func:`probe_local_reader`), which settles which local reader -- if
+    any -- can serve the slide before a single tile is committed to it.
 
     Shared by :func:`tile_slide` and ``lavlab.monai.build_datalist`` so the
     tiles written to disk and the samples handed to a training framework
@@ -2362,11 +3026,22 @@ def select_tiles(
     :type params: TileParams
     :param force_local: read a JPEG-2000 source locally anyway
     :type force_local: bool
+    :param tier: one of :data:`TIERS`. ``"auto"`` reads locally when it can
+        and falls forward to the network; ``"local"`` raises instead of
+        falling back (and reads JPEG-2000 sources locally); ``"network"``
+        never touches the local source.
+    :type tier: str
     :return: the selection; check :attr:`SlideSelection.status` first
     :rtype: SlideSelection
     :raises MissingPixelSizeError: with ``mpp`` but no recorded pixel size
-    :raises TilingError: for a slide that cannot be tiled as asked
+    :raises TilingError: for a slide that cannot be tiled as asked, including
+        one ``tier="local"`` cannot read locally
+    :raises TifffileUnavailableError: with ``tier="local"``, for a source
+        only the tifffile reader could read, when it is not installed
     """
+    if tier not in TIERS:
+        raise ValueError(f"tier must be one of {TIERS}, got {tier!r}")
+    requested_tier = tier
     image_id = int(image.getId())
     width0 = int(image.getSizeX())
     height0 = int(image.getSizeY())
@@ -2412,25 +3087,63 @@ def select_tiles(
         return selection
 
     analysis_ds = analysis_downsample(tiles[0].w0)
-    tier, src_path = choose_tier(conn, image_id, force_local=force_local)
+    src_path: str | None
+    if requested_tier == "network":
+        tier, src_path = "network", None
+    else:
+        tier, src_path = choose_tier(
+            conn, image_id, force_local=force_local or requested_tier == "local"
+        )
+        if requested_tier == "local" and (tier != "local" or src_path is None):
+            raise TilingError(
+                "--tier local, but "
+                + (
+                    "OMERO reports no original file for it."
+                    if src_path is None
+                    else f"its original '{src_path}' is not readable here."
+                )
+            )
+
+    def plans_for(dims: list[tuple[int, int]]) -> list[LevelPlan]:
+        widths = [w for w, _h in dims]
+        return [select_level(widths, width0, ds, params.size) for _m, ds in scale_ds]
 
     thumbnail = None
     level_dims: list[tuple[int, int]] = []
+    local_reader = None
     if tier == "local" and src_path is not None:
         try:
             level_dims = local_level_dims(src_path)
+            probe = tiles[len(tiles) // 2]
+            local_reader = probe_local_reader(
+                image_id,
+                src_path,
+                plans_for(level_dims),
+                level_dims,
+                (probe.x0, probe.y0, probe.w0, probe.h0),
+                required=requested_tier == "local",
+            )
             thumbnail = _load_thumbnail_local(src_path, analysis_ds)
+        except TifffileUnavailableError:
+            # Only escapes probe_local_reader under --tier local, and goes
+            # out as is: it names the extra to install.
+            raise
         except _local_source_errors() as exc:
+            if requested_tier == "local":
+                raise TilingError(
+                    f"--tier local, but '{src_path}' cannot be read locally -- "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
             warn_local_fallback(image_id, src_path, exc)
             tier = "network"
             thumbnail = None
+            local_reader = None
 
     if thumbnail is None:
         level_dims = network_level_dims(conn, image)
         thumbnail = _load_thumbnail_network(conn, image, analysis_ds)
 
-    level_widths = [w for w, _h in level_dims]
-    plans = [select_level(level_widths, width0, ds, params.size) for _m, ds in scale_ds]
+    plans = plans_for(level_dims)
     plan = plans[0]
     log.info(
         "Image %d: %d grid tiles, tier %s, pyramid level %d (x%.2f), analysis 1/%d.",
@@ -2443,6 +3156,7 @@ def select_tiles(
     )
     selection.analysis_ds = analysis_ds
     selection.tier = tier
+    selection.local_reader = local_reader
     selection.src_path = src_path
     selection.level_dims = level_dims
     selection.plans = plans
@@ -2570,6 +3284,8 @@ def tile_slide(
     manifest_path: str | None = None,
     dry_run: bool = False,
     store_count: int | None = None,
+    tier: str = "auto",
+    manifest_lock: bool = True,
 ) -> SlideResult:
     """Tile one slide into ``<out_root>/<subject>/<stem>/``.
 
@@ -2593,6 +3309,11 @@ def tile_slide(
     :type dry_run: bool
     :param store_count: parallel raw-pixels stores for network reads
     :type store_count: int | None
+    :param tier: one of :data:`TIERS`; see :func:`select_tiles`
+    :type tier: str
+    :param manifest_lock: lock *manifest_path* while appending; off for a
+        batch worker's own shard of it
+    :type manifest_lock: bool
     :return: what happened
     :rtype: SlideResult
     :raises TilingError: for a slide that cannot be tiled as asked
@@ -2610,7 +3331,12 @@ def tile_slide(
                 "Image %d: already tiled with these parameters, skipping.", image_id
             )
             if manifest_path:
-                append_manifest(manifest_path, read_manifest(slide_dir), out_root)
+                append_manifest(
+                    manifest_path,
+                    read_manifest(slide_dir),
+                    out_root,
+                    lock=manifest_lock,
+                )
             return SlideResult(
                 image_id,
                 "skipped",
@@ -2639,7 +3365,7 @@ def tile_slide(
         and params_match(read_tile_params(slide_dir), params)
     )
 
-    selection = select_tiles(conn, image, params, force_local=force_local)
+    selection = select_tiles(conn, image, params, force_local=force_local, tier=tier)
     if selection.status == "empty":
         return SlideResult(
             image_id,
@@ -2658,7 +3384,7 @@ def tile_slide(
             dry_run=dry_run,
         )
 
-    tier = selection.tier
+    served_tier = selection.tier
     src_path = selection.src_path
     level_dims = selection.level_dims
     tiles = selection.tiles
@@ -2676,7 +3402,7 @@ def tile_slide(
     erode_um = selection.erode_um
 
     common: dict[str, Any] = {
-        "tier": tier,
+        "tier": served_tier,
         "label_counts": label_counts,
         "stats": stats,
         "slide_dir": slide_dir,
@@ -2726,7 +3452,7 @@ def tile_slide(
                 _plan,
                 params,
                 _mpp,
-                tier,
+                served_tier,
                 selection.roi_id(record),
             )
 
@@ -2754,10 +3480,13 @@ def tile_slide(
                 todo.append((index, record, tile_path))
 
         if todo:
-            reader: LocalRegionReader | NetworkRegionReader
-            if tier == "local" and src_path is not None:
-                reader = LocalRegionReader(
-                    src_path, scale_plan, level_dims[scale_plan.index]
+            reader: LocalRegionReader | TifffileRegionReader | NetworkRegionReader
+            if served_tier == "local" and src_path is not None:
+                reader = open_local_reader(
+                    selection.local_reader or LOCAL_READERS[0],
+                    src_path,
+                    scale_plan,
+                    level_dims[scale_plan.index],
                 )
             elif store_count:
                 reader = NetworkRegionReader(
@@ -2806,7 +3535,7 @@ def tile_slide(
         params,
         status="complete",
         **identity,
-        tier=tier,
+        tier=served_tier,
         level=plan.index,
         levels={
             str(mpp_s): p.index for (mpp_s, _ds), p in zip(scale_ds, plans, strict=True)
@@ -2821,7 +3550,7 @@ def tile_slide(
         erode_um_effective=None if erode_um is None else round(erode_um, 3),
     )
     if manifest_path:
-        append_manifest(manifest_path, rows, out_root)
+        append_manifest(manifest_path, rows, out_root, lock=manifest_lock)
 
     if reused:
         log.info(
