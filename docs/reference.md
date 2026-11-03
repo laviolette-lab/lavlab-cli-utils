@@ -283,12 +283,56 @@ once every tile is written, so a crashed run leaves no manifest that
 
 **`--manifest PATH`** appends every slide's rows to one extra CSV, so a
 dataset built over several commands (one per class, group or scale) is
-indexed by a single file. Appends take an exclusive `flock`, so batch
-workers can share it; rows already present (same `tile_path`, or same
+indexed by a single file. Rows already present (same `tile_path`, or same
 image/label/centre/scale under `--coords-only`) are not repeated, so a
 resumed or repeated run is harmless; a slide skipped by `--skip-existing`
-still gets its rows added. A file with other columns is refused rather
-than mixed. Ignored under `--dry-run`.
+still gets its rows added. A file with other columns is refused -- in batch
+mode before any slide is tiled -- rather than mixed. Ignored under
+`--dry-run`.
+
+Batch workers never share the file: each appends to its own hidden shard
+beside it (`.<name>.<run>.<pid>.part`), and the parent merges the shards
+into the manifest once every slide is done, then deletes them. This is
+what makes `--manifest` work on SMB/CIFS and other network filesystems,
+where workers locking one file fails (`BlockingIOError: [Errno 35]`). The
+merge, and a single-image run's append, still take an exclusive `flock` to
+guard against two lavlab runs writing the same manifest. Where `flock`
+reports busy it is retried with jittered backoff; where it cannot lock at
+all it carries on unlocked with a `WARNING` -- so don't point two runs at
+one manifest on such a share at the same time. If the merge itself fails,
+the shards are kept and named in the log; every tile is still in its
+slide's own `manifest.csv`, and rerunning with `--skip-existing` rebuilds
+the combined file.
+
+**The merge never drops a row silently.** Shards are parsed strictly: a
+row must have exactly as many fields as the header, and the last row of a
+file counts only if the file ends with a line terminator. That second rule
+is what catches a write cut off *inside* the last field (`network` ->
+`netw`), which keeps the field count intact. It is reliable because every
+append (to a shard or the manifest) first refuses a file whose last line
+is unterminated, so a cut-off row can only ever be the last one -- never
+one with a later row glued on. Nothing is judged from the values, so
+quotes, commas, embedded newlines or an empty last column are fine. Every
+shard row then ends up one of:
+
+| Outcome | Where it goes |
+|---|---|
+| appended | the manifest |
+| identical to a row already there (same tile, same content) | counted; nothing is lost (normal on a `--skip-existing` resume) |
+| conflicting (same tile, different content) | **not** appended -- the existing row is kept -- and recorded |
+| malformed or cut off | dropped, logged with shard and line, and recorded |
+
+"Recorded" means written verbatim to `<manifest stem>.rejected-<run>.csv`
+(`shard,line,reason,raw`) beside the manifest, before any shard is
+deleted. Whenever any row is not appended, the merge logs a `WARNING` with
+the counts, and the batch summary repeats them:
+
+```
+Manifest: 0 row(s) appended from 8 worker shard(s); 412 not appended (412 identical to existing rows, 0 conflicting, 0 malformed)
+```
+
+A manifest that itself has a malformed row, or ends mid-row, is refused
+outright -- appending would make it worse -- with the line named.
 
 **Tile metadata.** Every tile file embeds, as JSON, `omero_image_id`,
 `case_id`, `slide_id`, `roi_id`, `shape_id`, `label`, `x`, `y`, `mpp`,
@@ -426,7 +470,13 @@ Dry run for image 12345 -- nothing was written.
 **Batch output and exit code.** A batch run ends with, at `INFO`:
 
 ```
+Batch run 20261103T153929Z.
+...
+1 failed slide(s) and their reasons written to /data/tiles/failures-20261103T153929Z.csv
 Batch complete: 120/128 slides tiled, 4 skipped, 3 unannotated, 1 failed.
+Failed by type: ResourceError=1
+      1 x ResourceError: Error instantiating pixel buffer: /OMERO/Pixels/512_pyramid
+  ResourceError: OMERO could not open these images' pixel files -- missing or corrupt on the server. Not retried: reconnecting cannot fix them.
 Served by tier: local=118, network=2
 Tiles by label: G3=41022, G4cg=8871, G4fg=9310, G5=2204, benign=240000
 Total tiles: 301407
@@ -441,15 +491,37 @@ caps:` line.) "Tiles" counts tile *locations*; with `--scales` each is
 written once per scale. The per-label line matters as much as the
 per-slide one: a run that "succeeded" on every slide while producing no
 `G5` tiles at all is a broken run, and only that line shows it. A batch
-exits non-zero only if *every* image failed; per-image errors are logged
-and the run continues.
+exits non-zero only if *every* image failed, naming the most common
+reason; per-image errors are logged and the run continues.
+
+**Why slides failed.** Every failed slide is logged once, as
+`Image <id>: failed -- <ExceptionType>: <message>` (so
+`grep -c ': failed -- '` counts them), and listed with its reason in
+`<out>/failures-<UTC start time>.csv` (`image_id,reason`), e.g.
+`failures-20261103T153929Z.csv`. Each batch writes its own file and never
+touches an earlier one, so a series of `--skip-existing` resumes keeps
+every run's failures side by side -- the history that tells a systematic
+problem (the same IDs, the same reason, every run) from a transient one.
+A clean run writes a header-only file, so it is on record too; two runs
+started in the same second get `-2`, `-3`, ... (`--dry-run` writes none).
+The `Failed by type:` breakdown is only logged, not saved; the per-run
+files hold everything it is computed from. The summary breaks the failure
+count down by exception type and lists the five most common reasons, so
+one cause failing many slides is one line with a big count.
+
+**The label map is read once.** `--labels` (or the bundled default) is
+loaded and parsed before connecting to OMERO, and that in-memory copy is
+handed to every worker. A file that can't be read stops the run at once
+(`error: cannot read the label map ...`), and a file that disappears
+mid-run -- a dropped network mount -- changes nothing.
 
 **Failure handling.** Each image is its own pool task, and the worker
 function never raises: any exception becomes a `failed` slide with a
 `WARNING` naming the image ID, and the parent independently counts an image
 as failed if its result cannot be collected. Only connection failures are
-retried (up to 3 attempts per slide), and only after closing the old
-session and logging in again. What counts as a connection failure is
+retried (up to 3 attempts per slide), each after closing the old session
+and waiting a jittered, exponentially growing delay (1-2 s, then 2-3 s),
+so workers that lost the server together don't log back in together. What counts as a connection failure is
 decided by exception type (`lavlab.omero_client.is_conn_error`), never by
 message text: `omero.SessionException` and Ice transport errors do;
 `omero.ResourceError` (corrupt or missing pixel buffer), any other

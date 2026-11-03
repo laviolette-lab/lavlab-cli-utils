@@ -417,7 +417,13 @@ the OMERO ROI the tile came from; `x`/`y` are the tile's level-0 *centre*
 tier) record how each tile was chosen -- see
 [`docs/reference.md`](docs/reference.md) for all of them. `--manifest`
 writes the same columns, with `tile_path` relative to the CSV's own
-folder so the index and tiles can be moved together.
+folder so the index and tiles can be moved together. It works on SMB and
+other network shares: batch workers each write a private shard, merged
+into the manifest at the end, instead of all locking one file. The merge
+never drops a row silently: duplicates and malformed rows are counted in a
+`WARNING` and the summary, and every row not appended (other than exact
+duplicates) is kept, with its shard and line, in
+`<manifest>.rejected-<run>.csv`.
 
 **Every tile describes itself**, too: the image ID, ROI ID, label, centre
 and mpp are embedded in the file (a PNG text chunk, or JPEG EXIF), so a
@@ -507,7 +513,10 @@ different decoder builds, so that is not guaranteed either.
 
 **Class folders** come from a `{folder: [textValue aliases]}` YAML
 (`src/lavlab/data/default_tile_labels.yaml`, overridable with `--labels`),
-matched case-insensitively and trimmed. The default maps the palette's
+matched case-insensitively and trimmed. It is read once, before the run
+connects to OMERO -- an unreadable file stops the run immediately, and one
+that vanishes mid-run (a dropped mount) cannot fail the slides still to
+come. The default maps the palette's
 `G4CG`/`G4FG` spellings onto the `G4cg`/`G4fg` folders the classifier
 expects, and lists the non-Gleason palette labels (`Atrophy`, `HGPIN`,
 `Seminal_Vesicles`, `Vessel`, `Urethra`) so `--all` doesn't warn about
@@ -518,8 +527,15 @@ Batch mode matches `lr batch`/`roi batch`: per-slide failures warn and
 continue, and the run ends with per-tier, per-label, ROI/erosion and
 done/skipped/unannotated/failed totals, with the image IDs for each. Any
 error on one slide -- including one nobody anticipated -- marks that slide
-failed and the batch carries on; only a slide whose *connection* dropped is
-retried, after logging in again. Workers stagger their first login, and if
+failed and the batch carries on. Each failure is logged once as
+`Image <id>: failed -- <Type>: <message>` and written to
+`<out>/failures-<UTC start time>.csv` (`image_id,reason`) -- a new file
+per run, so resumes keep the earlier runs' failures -- and the summary
+breaks the
+failures down by reason. An `omero.ResourceError` (a missing or corrupt
+pixel file on the server) fails just that image, with no reconnect and no
+retry; only a slide whose *connection* dropped is retried, after logging in
+again with a jittered, growing delay. Workers stagger their first login, and if
 OMERO's session service starts refusing logins (an Ice
 `ProtocolException`), retries back off longer and at random intervals
 instead of hammering it.

@@ -12,6 +12,7 @@ skipped rather than failed when omero-py isn't installed.
 from __future__ import annotations
 
 import csv
+import dataclasses
 import io
 import json
 import os
@@ -2812,3 +2813,217 @@ def test_scipy_computed_imports_are_named_for_nuitka():
     assert computed <= flagged, f"not named for Nuitka: {sorted(computed - flagged)}"
     for module in flagged:
         importlib.import_module(module)
+
+
+# --- the label map is loaded once and carried in TileParams ----------------
+
+
+def test_the_loaded_label_map_is_not_part_of_the_signature(tmp_path):
+    labels = tmp_path / "labels.yaml"
+    labels.write_text("Cancer: [g3]\n")
+    plain = _analysis_params(labels=str(labels))
+    loaded = dataclasses.replace(plain, label_map=load_label_map(str(labels)))
+
+    assert loaded.label_map == {"Cancer": ["g3"]}
+    assert loaded.signature() == plain.signature()
+    assert "label_map" not in plain.signature()
+    assert loaded == plain
+    write_params(str(tmp_path), loaded)
+    assert params_match(read_tile_params(str(tmp_path)), plain)
+
+
+@needs_omero
+def test_tile_slide_labels_from_the_loaded_map_without_rereading_the_file(
+    mocked_slide, tmp_path
+):
+    """The file is gone (a dropped mount); the in-memory copy still labels."""
+    labels = tmp_path / "labels.yaml"
+    labels.write_text("Cancer: [g3]\n")
+    params = _analysis_params(labels=str(labels), coords_only=True)
+    params = dataclasses.replace(params, label_map=load_label_map(str(labels)))
+    labels.unlink()
+
+    result = tiling.tile_slide(None, _FakeImage(), params, str(tmp_path / "out"))
+
+    assert result.status == "done"
+    assert result.label_counts["Cancer"] > 0
+
+
+# --- --manifest where flock does not work ----------------------------------
+
+
+def _flock_raising(errors):
+    """A flock that raises each of *errors* in turn, then succeeds."""
+    import fcntl
+
+    real = fcntl.flock
+    pending = list(errors)
+
+    def flock(fh, operation):
+        if operation == fcntl.LOCK_EX and pending:
+            raise pending.pop(0)
+        return real(fh, operation)
+
+    return flock
+
+
+def test_append_manifest_retries_a_lock_that_smb_says_is_busy(
+    tmp_path, monkeypatch, caplog
+):
+    import errno
+    import fcntl
+
+    busy = BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+    monkeypatch.setattr(fcntl, "flock", _flock_raising([busy, busy]))
+    monkeypatch.setattr(tiling.time, "sleep", lambda s: None)
+    manifest = tmp_path / "dataset.csv"
+
+    with caplog.at_level("WARNING"):
+        added = tiling.append_manifest(str(manifest), _manifest_rows(3), str(tmp_path))
+
+    assert added == 3
+    assert caplog.records == []  # got the lock on the third try
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        BlockingIOError(35, "Resource temporarily unavailable"),
+        OSError(__import__("errno").ENOTSUP, "Operation not supported"),
+    ],
+)
+def test_append_manifest_carries_on_unlocked_when_it_cannot_lock(
+    tmp_path, monkeypatch, caplog, error
+):
+    import fcntl
+
+    monkeypatch.setattr(fcntl, "flock", _flock_raising([error] * 50))
+    monkeypatch.setattr(tiling.time, "sleep", lambda s: None)
+    manifest = tmp_path / "dataset.csv"
+
+    with caplog.at_level("WARNING"):
+        added = tiling.append_manifest(str(manifest), _manifest_rows(3), str(tmp_path))
+
+    assert added == 3
+    with open(manifest, newline="") as fh:
+        assert len(list(csv.DictReader(fh))) == 3
+    (warning,) = caplog.records
+    assert "Could not lock --manifest" in warning.getMessage()
+
+
+def _shard(manifest, worker, rows, tmp_path):
+    shard = tiling.manifest_shard_path(str(manifest), "run", worker)
+    tiling.append_manifest(shard, rows, str(tmp_path), lock=False)
+    return shard
+
+
+def _read_rejected(path):
+    with open(path, newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def test_merge_manifest_shards_counts_every_row_it_does_not_append(tmp_path, caplog):
+    manifest = tmp_path / "dataset.csv"
+    tiling.append_manifest(str(manifest), _manifest_rows(2), str(tmp_path))
+    conflicting = _manifest_rows(2)[1:]
+    conflicting[0]["label"] = "G5"  # same tile as the manifest's t1, new label
+    shards = [
+        # t0 identical to the manifest's, t2 new
+        _shard(manifest, 11, _manifest_rows(3)[::2], tmp_path),
+        _shard(manifest, 12, conflicting + _manifest_rows(2, prefix="b/t"), tmp_path),
+    ]
+    with open(shards[1], "a", newline="") as fh:
+        fh.write("b/t9.png,1,,,,G3,,,,,,,,,,,,,,EXTRA\r\n")  # one field too many
+        fh.write("b/t8.png,1,,,,G3,,,,,,,,,,,,,netw")  # cut inside the last field
+
+    assert tiling.list_manifest_shards(str(manifest), "run") == shards
+    assert tiling.list_manifest_shards(str(manifest), "other-run") == []
+    with caplog.at_level("WARNING"):
+        merge = tiling.merge_manifest_shards(str(manifest), shards, run_id="run")
+
+    assert (merge.appended, merge.identical, merge.conflicting, merge.malformed) == (
+        3,
+        1,
+        1,
+        2,
+    )
+    with open(manifest, newline="") as fh:
+        kept = {row["tile_path"]: row["label"] for row in csv.DictReader(fh)}
+    assert kept == {
+        "N101/N101_S08_HE/G3/t0.png": "G3",
+        "N101/N101_S08_HE/G3/t1.png": "G3",  # the existing row wins the conflict
+        "N101/N101_S08_HE/G3/t2.png": "G3",
+        "b/t0.png": "G3",
+        "b/t1.png": "G3",
+    }
+    # every row not appended, except the identical one, is recorded verbatim
+    rejected = _read_rejected(merge.rejected_path)
+    assert [(r["shard"], r["line"], r["reason"].split(":")[0]) for r in rejected] == [
+        (shards[1], "5", "malformed"),
+        (shards[1], "6", "incomplete"),
+        (shards[1], "2", "conflicts with the existing row for the same tile"),
+    ]
+    assert rejected[1]["raw"].endswith(",netw")
+    assert ",G5," in rejected[2]["raw"]
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(f"'{shards[1]}' line 5 -- malformed: 20 fields" in m for m in messages)
+    assert any(f"'{shards[1]}' line 6 -- incomplete" in m for m in messages)
+    assert any(
+        "3 of 6 shard row(s) not appended" not in m
+        and "4 of 7 shard row(s) not appended -- 1 identical" in m
+        for m in messages
+    )
+    assert not any(os.path.exists(shard) for shard in shards)
+
+
+def test_a_legitimate_row_is_never_mistaken_for_a_cut_off_one(tmp_path):
+    """Detection is structural -- field count and the line terminator -- so
+    awkward but valid values (quotes, commas, embedded newlines, a form feed,
+    an empty last column) all pass."""
+    manifest = tmp_path / "dataset.csv"
+    awkward = _manifest_rows(5)
+    awkward[0]["label"] = 'He said "G3", twice'
+    awkward[1]["label"] = "two\nlines"
+    awkward[2]["label"] = "form\x0cfeed\u2028sep"
+    awkward[3]["tier"] = ""  # empty final field
+    awkward[4]["tile_path"] = "with,comma.png"
+    shard = _shard(manifest, 11, awkward, tmp_path)
+
+    merge = tiling.merge_manifest_shards(str(manifest), [shard], run_id="run")
+
+    assert (merge.appended, merge.malformed, merge.rejected_path) == (5, 0, None)
+    with open(manifest, newline="") as fh:
+        labels = [row["label"] for row in csv.DictReader(fh)]
+    assert labels[:3] == ['He said "G3", twice', "two\nlines", "form\x0cfeed\u2028sep"]
+
+
+def test_append_refuses_a_manifest_that_ends_mid_row(tmp_path):
+    """Appending after a cut-off write would glue the new row onto it."""
+    manifest = tmp_path / "dataset.csv"
+    tiling.append_manifest(str(manifest), _manifest_rows(1), str(tmp_path))
+    with open(manifest, "a") as fh:
+        fh.write("N101/N101_S08_HE/G3/t7.png,1,,,,G3")
+    before = manifest.read_bytes()
+
+    with pytest.raises(TilingError, match="line 3 is incomplete"):
+        tiling.append_manifest(
+            str(manifest), _manifest_rows(2, prefix="b/t"), str(tmp_path)
+        )
+
+    assert manifest.read_bytes() == before
+
+
+def test_append_manifest_warns_about_rows_it_skips(tmp_path, caplog):
+    manifest = tmp_path / "dataset.csv"
+    tiling.append_manifest(str(manifest), _manifest_rows(2), str(tmp_path))
+    again = _manifest_rows(2)
+    again[1]["label"] = "G5"
+
+    with caplog.at_level("WARNING"):
+        added = tiling.append_manifest(str(manifest), again, str(tmp_path))
+
+    assert added == 0
+    messages = [r.getMessage() for r in caplog.records]
+    assert "1 identical to rows already there" in messages[0]
+    assert "1 CONFLICTING" in messages[0]
+    assert ",G5," in messages[1]

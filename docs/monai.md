@@ -117,6 +117,16 @@ managed repository is mounted, OMERO's tile API otherwise. The same
 JPEG-2000 rule and fall-forward-with-`WARNING` apply. The tier that served
 each patch is in `sample["image"].meta["tier"]`.
 
+Opening a slide probes its local file exactly as `lavlab tile` does:
+pyvips first, then tifffile (`pip install 'lavlab-cli-utils[tifffile]'`),
+then the network. That matters here because about half the archive is
+separate-plane TIFF, which libvips opens but cannot read: without the
+extra, those slides stream over the network. With it, they are read
+locally, and the probe's one `WARNING` per slide (per DataLoader worker)
+is all you see. The reader that won is `OmeroWSI.local_reader`. A local
+file that starts failing *after* the probe (a flaky mount) still falls
+forward to the network for the rest of that slide.
+
 ### DataLoader workers
 
 Every process opens its own OMERO session on its first read. A session
